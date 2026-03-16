@@ -43,8 +43,9 @@ class LMCBlender:
         # TODO(Jiayi): support threshold-based blending
         # TODO(Jiayi): support different ratios for different layers
         # TODO(Jiayi): support "skipping blending if hit too short"
+        check_layers = tuple(config.blend_check_layers or [])
         self.common_metadata = LMCBlendCommonMetadata(
-            check_layers=config.blend_check_layers,
+            check_layers=check_layers,
             recomp_ratios=config.blend_recompute_ratios,
             thresholds=config.blend_thresholds,
         )

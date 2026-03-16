@@ -12,13 +12,13 @@ logger = init_logger(__name__)
 
 
 def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
+    vllm_model = _unwrap_vllm_model(vllm_model)
     model_name = type(vllm_model).__name__
-    if model_name == "LlamaForCausalLM":
-        # First Party
-        from lmcache.v1.compute.models.llama import LMCLlamaModel
-
-        return LMCLlamaModel(vllm_model, blender, enable_sparse)
-    elif model_name == "Qwen2ForCausalLM":
+    if model_name in {
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+        "Qwen2ForCausalLM",
+    }:
         # First Party
         from lmcache.v1.compute.models.llama import LMCLlamaModel
 
@@ -33,6 +33,27 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
         raise NotImplementedError(
             f"Model type {model_name} is not supported in LMCache."
         )
+
+
+def _unwrap_vllm_model(vllm_model: nn.Module) -> nn.Module:
+    """Unwrap vLLM runtime wrappers before inferring the model adapter."""
+
+    wrapper_names = {"CUDAGraphWrapper", "UBatchWrapper"}
+    while type(vllm_model).__name__ in wrapper_names:
+        if hasattr(vllm_model, "unwrap"):
+            vllm_model = vllm_model.unwrap()
+            continue
+
+        if hasattr(vllm_model, "runnable"):
+            vllm_model = vllm_model.runnable
+            continue
+
+        logger.warning(
+            "Unable to unwrap vLLM model wrapper %s.", type(vllm_model).__name__
+        )
+        break
+
+    return vllm_model
 
 
 class VLLMModelTracker:

@@ -114,7 +114,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_float_list,
     },
     "blend_check_layers": {
-        "type": list[int],
+        "type": Optional[list[int]],
         "default": None,
         "env_converter": _to_int_list,
     },

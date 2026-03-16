@@ -120,6 +120,10 @@ class LMCacheLookupClient(LookupClientInterface):
                 request_configs_str,
             ]
         else:
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            elif not isinstance(token_ids, list):
+                token_ids = list(token_ids)
             msg_buf = [
                 token_ids,
                 lookup_id,

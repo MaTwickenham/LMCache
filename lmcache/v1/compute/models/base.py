@@ -63,13 +63,35 @@ class LMCBaseModel(nn.Module, ABC):
         """Process QKV tensors. Model-specific implementation."""
         pass
 
+    def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Bridge embedding API differences across supported vLLM versions.
+        """
+        if hasattr(self.vllm_model, "embed_input_ids"):
+            return self.vllm_model.embed_input_ids(input_ids)
+
+        if hasattr(self.vllm_model, "get_input_embeddings"):
+            embedding = self.vllm_model.get_input_embeddings()
+            if callable(embedding):
+                return embedding(input_ids)
+
+        if hasattr(self.vllm_model, "model"):
+            if hasattr(self.vllm_model.model, "embed_input_ids"):
+                return self.vllm_model.model.embed_input_ids(input_ids)
+            if hasattr(self.vllm_model.model, "embed_tokens"):
+                return self.vllm_model.model.embed_tokens(input_ids)
+
+        raise AttributeError(
+            f"Unable to locate an embedding entrypoint for {type(self.vllm_model).__name__}."
+        )
+
     @torch.compile
     def compute_layer(
         self,
         input_ids: torch.Tensor,
     ):
         input_ids = input_ids.cuda()
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids)
+        hidden_states = self._embed_input_ids(input_ids)
         residual = None
 
         attn_output = None
