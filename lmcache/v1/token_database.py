@@ -443,15 +443,27 @@ class SegmentTokenDatabase(TokenDatabase):
 
         if self.sep_len == 0 or len(tokens) < self.sep_len:
             yield tokens
+            return
 
         # Unfold into sliding windows
         # shape: (num_tokens-sep_len+1, sep_len)
         windows = tokens.unfold(0, self.sep_len, 1)
 
         # Compare each window with sep_tokens
-        matches = (
+        raw_matches = (
             (windows == self.sep_tokens).all(dim=1).nonzero(as_tuple=True)[0].tolist()
         )
+
+        # Use left-to-right non-overlapping matches. Separators like [422, 422]
+        # self-overlap, so consuming every sliding-window hit can create empty
+        # chunks and spans that run past the end of the token sequence.
+        matches = []
+        next_valid_idx = 0
+        for idx in raw_matches:
+            if idx < next_valid_idx:
+                continue
+            matches.append(idx)
+            next_valid_idx = idx + self.sep_len
 
         # Split based on matches
         start = 0

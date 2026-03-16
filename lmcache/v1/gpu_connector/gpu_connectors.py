@@ -943,14 +943,34 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     strict=False,
                 ):
                     assert memory_obj.tensor is not None
-                    memory_obj.tensor[0].copy_(
-                        tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    memory_obj.tensor[1].copy_(
-                        tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
-                        non_blocking=True,
-                    )
+                    try:
+                        memory_obj.tensor[0].copy_(
+                            tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        memory_obj.tensor[1].copy_(
+                            tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                    except RuntimeError as exc:
+                        dst_k = memory_obj.tensor[0]
+                        dst_v = memory_obj.tensor[1]
+                        src_k = tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end]
+                        src_v = tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end]
+                        raise RuntimeError(
+                            "Layerwise store copy failed in batched_from_gpu: "
+                            f"layer_id={layer_id}, "
+                            f"buf_range=[{buf_start}, {buf_end}), "
+                            f"src_k_shape={tuple(src_k.shape)}, "
+                            f"dst_k_shape={tuple(dst_k.shape)}, "
+                            f"src_v_shape={tuple(src_v.shape)}, "
+                            f"dst_v_shape={tuple(dst_v.shape)}, "
+                            f"memory_obj_shape={tuple(memory_obj.metadata.shape)}, "
+                            f"cached_positions_shape="
+                            f"{None if old_positions is None else tuple(old_positions.shape)}, "
+                            f"slot_mapping_full_shape={tuple(slot_mapping_full.shape)}, "
+                            f"starts={starts}, ends={ends}"
+                        ) from exc
                     if self.cache_positions:
                         memory_obj.metadata.cached_positions = old_positions
 

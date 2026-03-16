@@ -378,19 +378,20 @@ class ReqMeta:
 
         num_blocks = len(tracker.allocated_block_ids)
 
-        if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks"
-                " for request %s. "
-                "Something might be wrong in scheduling logic!",
+        max_slot_tokens = num_blocks * block_size
+        if len(token_ids) > max_slot_tokens:
+            logger.warning(
+                "Clipping token_ids to slot mapping capacity for request %s. "
+                "num_tokens=%d, max_slot_tokens=%d, block_size=%d",
                 tracker.req_id,
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
                 len(token_ids),
-                num_blocks,
+                max_slot_tokens,
                 block_size,
             )
+            token_ids = token_ids[:max_slot_tokens]
+            num_tokens_to_save = min(num_tokens_to_save, max_slot_tokens)
+            if not skip_save:
+                tracker.num_saved_tokens = num_tokens_to_save
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
@@ -1031,6 +1032,19 @@ class LMCacheConnectorV1Impl:
 
                 slot_mapping = request.slot_mapping
                 assert isinstance(slot_mapping, torch.Tensor)
+                if len(slot_mapping) != len(token_ids):
+                    clipped_len = min(len(slot_mapping), len(token_ids))
+                    logger.warning(
+                        "Clipping layerwise store inputs for request %s to keep "
+                        "token_ids and slot_mapping aligned. token_ids=%d, "
+                        "slot_mapping=%d, clipped=%d",
+                        request.req_id,
+                        len(token_ids),
+                        len(slot_mapping),
+                        clipped_len,
+                    )
+                    token_ids = token_ids[:clipped_len]
+                    slot_mapping = slot_mapping[:clipped_len]
                 assert len(slot_mapping) == len(token_ids)
 
                 # TODO: have a pre-allocated buffer to hold the slot_mappings
@@ -1040,7 +1054,9 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = 0
                 else:
                     assert save_spec is not None
-                    skip_leading_tokens = save_spec.skip_leading_tokens
+                    skip_leading_tokens = min(
+                        save_spec.skip_leading_tokens, len(token_ids)
+                    )
 
                     if skip_leading_tokens == len(token_ids):
                         continue  # skip this request
@@ -1050,6 +1066,20 @@ class LMCacheConnectorV1Impl:
                         // self._lmcache_chunk_size
                         * self._lmcache_chunk_size
                     )
+
+                    # In CacheBlend-style serving we only need the offline
+                    # fragment-prefill objects to stay in LMCache. Re-saving an
+                    # online blended prompt after partially reusing cached KV can
+                    # hit shape-mismatch bugs in the current layerwise store path
+                    # and does not materially help the fragment-pool benchmark.
+                    if self.config.enable_blending and skip_leading_tokens > 0:
+                        logger.debug(
+                            "Skipping save for blended request %s after %d "
+                            "reused leading tokens.",
+                            request.req_id,
+                            skip_leading_tokens,
+                        )
+                        continue
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
