@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import time
 
 # Third Party
 import torch
@@ -23,6 +24,7 @@ from lmcache.v1.gpu_connector.utils import (
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.phase_timing import record_phase
 
 if torch.cuda.is_available():
     # First Party
@@ -706,6 +708,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
+        req_id = kwargs.get("req_id")
+        to_gpu_start = time.perf_counter()
+        buffer_load_copy_s = 0.0
+        paged_kv_transfer_s = 0.0
+        rope_recover_s = 0.0
+
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -768,6 +776,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             )
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
+                paged_transfer_start = time.perf_counter()
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
                     self.kvcaches[layer_id - 2],
@@ -776,6 +785,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     self.gpu_kv_format,
                     token_major=False,  # shape is [2, num_tokens, hidden_dim]
                 )
+                paged_kv_transfer_s += time.perf_counter() - paged_transfer_start
                 del self.buffer_mapping[layer_id - 2]
 
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
@@ -793,15 +803,19 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.cache_positions:
                     assert compute_gpu_buffer_obj.tensor is not None
 
+                    rope_start = time.perf_counter()
                     compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
                         old_positions_full,
                         new_positions_full,
                         compute_gpu_buffer_obj.tensor[0],
                     )
+                    rope_recover_s += time.perf_counter() - rope_start
 
                 # gap zeroing after RoPE
                 if self.current_gap_positions.numel():
+                    gap_zero_start = time.perf_counter()
                     compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                    rope_recover_s += time.perf_counter() - gap_zero_start
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
@@ -812,6 +826,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
                 # memobj -> gpu_buffer
                 with torch.cuda.stream(self.load_stream):
+                    copy_start = time.perf_counter()
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -829,6 +844,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.cached_positions
+                    buffer_load_copy_s += time.perf_counter() - copy_start
 
             elif layer_id == self.num_layers:
                 yield
@@ -840,6 +856,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert len(self.buffer_mapping) == 0, (
             "There are still layers in the buffer mapping after "
             "releasing the GPU buffers."
+        )
+
+        record_phase(req_id, "to_gpu_buffer_load_copy_s", buffer_load_copy_s)
+        record_phase(req_id, "to_gpu_paged_kv_transfer_s", paged_kv_transfer_s)
+        record_phase(req_id, "to_gpu_rope_recover_s", rope_recover_s)
+        record_phase(
+            req_id,
+            "to_gpu_total_s",
+            time.perf_counter() - to_gpu_start,
+            retrieved_spans=len(starts),
         )
 
         yield

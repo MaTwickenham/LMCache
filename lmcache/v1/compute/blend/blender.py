@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional, Union
+import time
 
 # Third Party
 import torch
@@ -11,6 +12,7 @@ from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.phase_timing import record_phase
 
 logger = init_logger(__name__)
 
@@ -163,7 +165,16 @@ class LMCBlender:
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
 
+        req_id = kwargs.get("req_id")
+        blend_start = time.perf_counter()
         layerwise_blender = self.blend_layer(tokens, mask, **kwargs)
 
         for i in range(self.num_layers + 2):
             next(layerwise_blender)
+
+        record_phase(
+            req_id,
+            "blend_total_s",
+            time.perf_counter() - blend_start,
+            cached_tokens=len(tokens),
+        )

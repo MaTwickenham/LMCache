@@ -30,6 +30,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 class RequestMeasurement:
     """Request-level latency measurements."""
 
+    request_id: str | None
     ttft_s: float | None
     wall_s: float
     prompt_tokens: int
@@ -320,6 +321,9 @@ def run_blend_cpu_benchmark(
                     model=args.model,
                     prompt_ids=prompt_ids,
                     max_tokens=args.max_tokens,
+                    kv_transfer_params={
+                        "lmcache.request_kind": "fragment_prefill",
+                    },
                 )
             )
         prefill_wall_s = time.perf_counter() - prefill_start
@@ -330,6 +334,9 @@ def run_blend_cpu_benchmark(
             model=args.model,
             prompt_ids=final_prompt_ids,
             max_tokens=args.max_tokens,
+            kv_transfer_params={
+                "lmcache.request_kind": "online_blended_query",
+            },
         )
 
     return ChunkBlendResult(
@@ -608,6 +615,7 @@ def measure_streaming_request(
     model: str,
     prompt_ids: list[int],
     max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None = None,
 ) -> RequestMeasurement:
     """Measure TTFT and total wall time using the streaming completions API."""
 
@@ -621,12 +629,15 @@ def measure_streaming_request(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if kv_transfer_params is not None:
+        payload["kv_transfer_params"] = kv_transfer_params
 
     url = f"http://127.0.0.1:{port}/v1/completions"
     start_time = time.perf_counter()
     first_token_time: float | None = None
     generated_parts: list[str] = []
     cached_tokens: int | None = None
+    request_id: str | None = None
 
     with session.post(url, json=payload, stream=True, timeout=180) as response:
         if response.status_code != 200:
@@ -645,6 +656,8 @@ def measure_streaming_request(
                 break
 
             chunk = json.loads(data)
+            if request_id is None:
+                request_id = chunk.get("id")
             choices = chunk.get("choices") or []
             if choices:
                 text = choices[0].get("text", "")
@@ -664,6 +677,7 @@ def measure_streaming_request(
         ttft_s = first_token_time - start_time
 
     return RequestMeasurement(
+        request_id=request_id,
         ttft_s=ttft_s,
         wall_s=wall_s,
         prompt_tokens=len(prompt_ids),

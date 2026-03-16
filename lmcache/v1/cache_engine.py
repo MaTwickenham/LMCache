@@ -53,6 +53,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.phase_timing import record_phase
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -928,6 +929,7 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        retrieve_start = time.perf_counter()
 
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
@@ -940,6 +942,7 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        retrieve_prepare_start = time.perf_counter()
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
@@ -975,6 +978,17 @@ class LMCacheEngine:
 
             ret_mask[start:end] = True
 
+        record_phase(
+            req_id,
+            "retrieve_prepare_s",
+            time.perf_counter() - retrieve_prepare_start,
+            cached_tokens=len(tokens),
+            retrieved_spans=len(keys),
+        )
+
+        storage_wait_s = 0.0
+        gpu_send_s = 0.0
+        mem_obj_consumer = None
         if keys:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
@@ -1002,8 +1016,13 @@ class LMCacheEngine:
                 else:
                     yield None
 
+                storage_wait_start = time.perf_counter()
                 mem_objs_layer = task.result()
+                storage_wait_s += time.perf_counter() - storage_wait_start
+
+                gpu_send_start = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
+                gpu_send_s += time.perf_counter() - gpu_send_start
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
@@ -1017,10 +1036,29 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        record_phase(
+            req_id,
+            "retrieve_storage_wait_s",
+            storage_wait_s,
+            cached_tokens=int(retrieved_tokens),
+        )
+        record_phase(
+            req_id,
+            "retrieve_gpu_send_s",
+            gpu_send_s,
+            cached_tokens=int(retrieved_tokens),
+        )
+        record_phase(
+            req_id,
+            "retrieve_total_s",
+            time.perf_counter() - retrieve_start,
+            cached_tokens=int(retrieved_tokens),
+        )
         if not self._is_passive():
             logger.info(
                 "[req_id=%s] Retrieved %d out of %d out of total %d tokens",

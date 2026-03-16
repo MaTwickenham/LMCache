@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -41,6 +42,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.phase_timing import record_phase
 
 if TYPE_CHECKING:
     # Third Party
@@ -331,11 +333,31 @@ class ReqMeta:
 
         # NOTE(vladnosiv): for disagg, you cannot skip saving, as saving is a transfer
         # Check if request_configs has lmcache.skip_save set to True
-        request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
+        request_configs = tracker.request_configs or {}
+        request_skip = request_configs.get("lmcache.skip_save", False)
+        request_kind = request_configs.get("lmcache.request_kind")
+        is_fragment_prefill = request_kind == "fragment_prefill"
+
+        # Prefix-style chunked saving should wait for the next LMCache chunk
+        # boundary before storing more KV, but benchmark fragment-prefill
+        # requests are intentionally much smaller than chunk_size and should
+        # still materialize their fragment KV objects into LMCache.
+        skip_small_partial_save = (
+            tracker.num_saved_tokens > 0
+            and input_token_len < chunk_boundary
+            and not is_fragment_prefill
+        )
+
+        # For long fragments, vLLM chunked prefill can split one fragment
+        # request across multiple scheduler steps. Saving intermediate steps
+        # would materialize incomplete segment keys, so defer CacheBlend
+        # fragment-prefill saves until the request reaches its final prefill.
+        delay_fragment_prefill_save = is_fragment_prefill and not is_last_prefill
 
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or skip_small_partial_save
+            or delay_fragment_prefill_save
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )
@@ -825,6 +847,7 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        req_id=request.req_id,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -834,6 +857,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -1305,10 +1329,18 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
+            lookup_start = time.perf_counter()
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
+            )
+            record_phase(
+                req_id,
+                "lookup_total_s",
+                time.perf_counter() - lookup_start,
+                prompt_tokens=len(token_ids),
+                request_configs=bool(request_configs),
             )
 
         if num_external_hit_tokens is None:

@@ -23,6 +23,8 @@ import hashlib
 import json
 import math
 import random
+import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -55,6 +57,7 @@ class QueryRecord:
     chunk_ids: list[str]
     prompt_ids: list[int]
     prompt_tokens: int
+    memory_prefix_tokens: int
 
 
 @dataclass
@@ -104,9 +107,20 @@ class BlendChunkResult:
     chunk_size: int
     prefill: PrefillSummary
     online: LatencySummary
+    online_phase_breakdown: dict[str, "PhaseSummary"]
     end_to_end_total_wall_s: float
     end_to_end_total_ttft_s: float
     first_query_total_including_prefill_s: float
+
+
+@dataclass
+class PhaseSummary:
+    sample_count: int
+    total_s: float
+    mean_s: float
+    p50_s: float
+    p90_s: float
+    max_s: float
 
 
 @dataclass
@@ -122,6 +136,10 @@ class WorkloadStats:
     p50_prompt_tokens: float
     p90_prompt_tokens: float
     max_prompt_tokens: int
+    mean_memory_prefix_tokens: float
+    p50_memory_prefix_tokens: float
+    p90_memory_prefix_tokens: float
+    max_memory_prefix_tokens: int
     prompt_layout: str
     fragment_order_policy: str
     shuffle_seed: int
@@ -366,13 +384,22 @@ def build_memoryos_workload(
                 if chunk_id not in prefill_order:
                     prefill_order.append(chunk_id)
 
+            fragment_token_ids = [
+                list(unique_chunks[chunk_id]["token_ids"]) for chunk_id in ordered_chunk_ids
+            ]
             prompt_ids = build_prompt_token_ids(
                 tokenizer=tokenizer,
                 system_prompt_ids=system_prompt_ids,
                 blend_special_ids=blend_special_ids,
-                fragment_token_ids=[
-                    list(unique_chunks[chunk_id]["token_ids"]) for chunk_id in ordered_chunk_ids
-                ],
+                fragment_token_ids=fragment_token_ids,
+                question_text=str(qa_trace.get("question", "")),
+                prompt_layout=prompt_layout,
+            )
+            memory_prefix_tokens = estimate_memory_prefix_tokens(
+                tokenizer=tokenizer,
+                system_prompt_ids=system_prompt_ids,
+                blend_special_ids=blend_special_ids,
+                fragment_token_ids=fragment_token_ids,
                 question_text=str(qa_trace.get("question", "")),
                 prompt_layout=prompt_layout,
             )
@@ -392,6 +419,7 @@ def build_memoryos_workload(
                     chunk_ids=ordered_chunk_ids,
                     prompt_ids=prompt_ids,
                     prompt_tokens=len(prompt_ids),
+                    memory_prefix_tokens=memory_prefix_tokens,
                 )
             )
 
@@ -606,6 +634,47 @@ def build_prompt_token_ids(
     )
 
 
+def estimate_memory_prefix_tokens(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    system_prompt_ids: list[int],
+    blend_special_ids: list[int],
+    fragment_token_ids: list[list[int]],
+    question_text: str,
+    prompt_layout: str,
+) -> int:
+    """Estimate the theoretical reusable prefix length for the query prompt."""
+
+    if prompt_layout == "memory_first":
+        question_token_ids = list(
+            tokenizer.encode(
+                f"Question: {question_text}\nAnswer:",
+                add_special_tokens=False,
+            )
+        )
+        prompt_ids = build_prompt_token_ids(
+            tokenizer=tokenizer,
+            system_prompt_ids=system_prompt_ids,
+            blend_special_ids=blend_special_ids,
+            fragment_token_ids=fragment_token_ids,
+            question_text=question_text,
+            prompt_layout=prompt_layout,
+        )
+        return max(len(prompt_ids) - len(question_token_ids), 0)
+
+    if prompt_layout == "question_first":
+        prompt_ids = list(system_prompt_ids)
+        question_prefix_ids = list(
+            tokenizer.encode(f"Question: {question_text}\n", add_special_tokens=False)
+        )
+        append_token_segment(prompt_ids, question_prefix_ids, skip_bos=bool(prompt_ids))
+        return len(prompt_ids)
+
+    raise ValueError(
+        f"Unsupported prompt_layout={prompt_layout!r}; choose one of {PROMPT_LAYOUT_CHOICES}"
+    )
+
+
 def append_memory_first_segments(
     *,
     prompt_ids: list[int],
@@ -715,6 +784,7 @@ def build_workload_stats(
 ) -> WorkloadStats:
     fragment_counts = [len(record.chunk_ids) for record in query_records]
     prompt_lengths = [record.prompt_tokens for record in query_records]
+    memory_prefix_lengths = [record.memory_prefix_tokens for record in query_records]
     total_unique_fragment_tokens = sum(
         int(chunk.get("tokens", 0)) for chunk in unique_chunks.values()
     )
@@ -730,6 +800,10 @@ def build_workload_stats(
         p50_prompt_tokens=percentile(prompt_lengths, 0.50),
         p90_prompt_tokens=percentile(prompt_lengths, 0.90),
         max_prompt_tokens=max(prompt_lengths) if prompt_lengths else 0,
+        mean_memory_prefix_tokens=_safe_mean(memory_prefix_lengths),
+        p50_memory_prefix_tokens=percentile(memory_prefix_lengths, 0.50),
+        p90_memory_prefix_tokens=percentile(memory_prefix_lengths, 0.90),
+        max_memory_prefix_tokens=max(memory_prefix_lengths) if memory_prefix_lengths else 0,
         prompt_layout=prompt_layout,
         fragment_order_policy=fragment_order_policy,
         shuffle_seed=int(shuffle_seed),
@@ -815,6 +889,13 @@ def run_blend_cpu_workload(
 
     session = requests.Session()
     session.trust_env = False
+    phase_file = Path(
+        tempfile.NamedTemporaryFile(
+            prefix=f"lmcache_phase_chunk{chunk_size}_",
+            suffix=".jsonl",
+            delete=False,
+        ).name
+    )
 
     prefill_measurements: list[RequestMeasurement] = []
     query_measurements: list[RequestMeasurement] = []
@@ -829,6 +910,7 @@ def run_blend_cpu_workload(
         "LMCACHE_USE_LAYERWISE": "True",
         "LMCACHE_BLEND_CHECK_LAYERS": str(args.blend_check_layers),
         "LMCACHE_BLEND_RECOMPUTE_RATIOS": str(args.blend_recompute_ratios),
+        "LMCACHE_PHASE_TIMING_PATH": str(phase_file),
     }
 
     with launch_server(
@@ -862,6 +944,9 @@ def run_blend_cpu_workload(
                         model=args.model,
                         prompt_ids=record.prompt_ids,
                         max_tokens=args.max_tokens,
+                        kv_transfer_params={
+                            "lmcache.request_kind": "fragment_prefill",
+                        },
                     )
                 )
             except Exception as exc:
@@ -884,6 +969,9 @@ def run_blend_cpu_workload(
                         model=args.model,
                         prompt_ids=record.prompt_ids,
                         max_tokens=args.max_tokens,
+                        kv_transfer_params={
+                            "lmcache.request_kind": "online_blended_query",
+                        },
                     )
                 )
             except Exception as exc:
@@ -897,6 +985,11 @@ def run_blend_cpu_workload(
                     f"prompt_tokens={record.prompt_tokens}\n"
                     f"server_tail:\n{server.tail_text()}"
                 ) from exc
+
+    online_phase_breakdown = summarize_online_phase_breakdown(
+        phase_file=phase_file,
+        measurements=query_measurements,
+    )
 
     prefill_summary = summarize_prefill(
         measurements=prefill_measurements,
@@ -914,6 +1007,7 @@ def run_blend_cpu_workload(
         chunk_size=chunk_size,
         prefill=prefill_summary,
         online=online_summary,
+        online_phase_breakdown=online_phase_breakdown,
         end_to_end_total_wall_s=prefill_summary.wall_s + online_summary.total_wall_s,
         end_to_end_total_ttft_s=prefill_summary.wall_s + online_summary.total_ttft_s,
         first_query_total_including_prefill_s=prefill_summary.wall_s + first_query_ttft_s,
@@ -975,6 +1069,116 @@ def summarize_measurements(
     )
 
 
+def summarize_online_phase_breakdown(
+    *,
+    phase_file: Path,
+    measurements: list[RequestMeasurement],
+) -> dict[str, PhaseSummary]:
+    request_ids = [m.request_id for m in measurements if m.request_id]
+    if not request_ids or not phase_file.exists():
+        return {}
+
+    phase_records = load_phase_records(phase_file)
+    phase_to_request_duration = build_phase_duration_map(
+        request_ids=request_ids,
+        phase_records=phase_records,
+    )
+    add_derived_phase_durations(phase_to_request_duration, request_ids)
+    return {
+        phase: summarize_phase_values(
+            [phase_to_request_duration[phase].get(req_id, 0.0) for req_id in request_ids]
+        )
+        for phase in sorted(phase_to_request_duration)
+    }
+
+
+def load_phase_records(phase_file: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in phase_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        records.append(json.loads(line))
+    return records
+
+
+def build_phase_duration_map(
+    *,
+    request_ids: list[str],
+    phase_records: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    normalized_to_original = {
+        normalize_request_id(req_id): req_id for req_id in request_ids
+    }
+    request_id_set = set(normalized_to_original)
+    phase_to_request_duration: dict[str, dict[str, float]] = {}
+    for record in phase_records:
+        req_id = normalize_request_id(str(record.get("req_id", "")))
+        if req_id not in request_id_set:
+            continue
+        original_req_id = normalized_to_original[req_id]
+        phase = str(record.get("phase", ""))
+        duration_s = float(record.get("duration_s", 0.0))
+        if phase not in phase_to_request_duration:
+            phase_to_request_duration[phase] = {}
+        phase_to_request_duration[phase][original_req_id] = (
+            phase_to_request_duration[phase].get(original_req_id, 0.0) + duration_s
+        )
+    return phase_to_request_duration
+
+
+def normalize_request_id(req_id: str) -> str:
+    return re.sub(r"-\d+$", "", req_id)
+
+
+def add_derived_phase_durations(
+    phase_to_request_duration: dict[str, dict[str, float]],
+    request_ids: list[str],
+) -> None:
+    def get_duration(phase: str, req_id: str) -> float:
+        return phase_to_request_duration.get(phase, {}).get(req_id, 0.0)
+
+    blend_compute_only: dict[str, float] = {}
+    retrieve_other: dict[str, float] = {}
+    to_gpu_other: dict[str, float] = {}
+
+    for req_id in request_ids:
+        blend_compute_only[req_id] = max(
+            get_duration("blend_total_s", req_id)
+            - get_duration("retrieve_total_s", req_id),
+            0.0,
+        )
+        retrieve_other[req_id] = max(
+            get_duration("retrieve_total_s", req_id)
+            - get_duration("retrieve_prepare_s", req_id)
+            - get_duration("retrieve_storage_wait_s", req_id)
+            - get_duration("to_gpu_total_s", req_id),
+            0.0,
+        )
+        to_gpu_other[req_id] = max(
+            get_duration("to_gpu_total_s", req_id)
+            - get_duration("to_gpu_buffer_load_copy_s", req_id)
+            - get_duration("to_gpu_paged_kv_transfer_s", req_id)
+            - get_duration("to_gpu_rope_recover_s", req_id),
+            0.0,
+        )
+
+    phase_to_request_duration["blend_compute_only_s"] = blend_compute_only
+    phase_to_request_duration["retrieve_other_s"] = retrieve_other
+    phase_to_request_duration["to_gpu_other_s"] = to_gpu_other
+
+
+def summarize_phase_values(values: list[float]) -> PhaseSummary:
+    return PhaseSummary(
+        sample_count=len(values),
+        total_s=float(sum(values)),
+        mean_s=_safe_mean(values),
+        p50_s=percentile(values, 0.50),
+        p90_s=percentile(values, 0.90),
+        max_s=max(values) if values else 0.0,
+    )
+
+
 def percentile(values: Iterable[float | int], ratio: float) -> float:
     ordered = sorted(float(value) for value in values)
     if not ordered:
@@ -1022,6 +1226,13 @@ def print_workload_stats(stats: WorkloadStats) -> None:
         f"p90={stats.p90_prompt_tokens:.1f}, "
         f"max={stats.max_prompt_tokens}"
     )
+    print(
+        "theoretical_memory_prefix_tokens: "
+        f"mean={stats.mean_memory_prefix_tokens:.1f}, "
+        f"p50={stats.p50_memory_prefix_tokens:.1f}, "
+        f"p90={stats.p90_memory_prefix_tokens:.1f}, "
+        f"max={stats.max_memory_prefix_tokens}"
+    )
     print(f"prompt_layout: {stats.prompt_layout}")
     print(f"fragment_order_policy: {stats.fragment_order_policy}")
     print(f"shuffle_seed: {stats.shuffle_seed}")
@@ -1058,6 +1269,7 @@ def print_result(result: BenchmarkResult) -> None:
             f"p90={item.prefill.p90_ttft_s:.4f}"
         )
         print_mode_summary("online query", item.online, print_header=False)
+        print_phase_breakdown(item.online_phase_breakdown)
         print(
             "including_prefill: "
             f"first_query_total_s={item.first_query_total_including_prefill_s:.4f}, "
@@ -1113,6 +1325,43 @@ def print_mode_summary(title: str, summary: LatencySummary, *, print_header: boo
         f"hit_rate={summary.cache_hit_rate:.2%}"
     )
     print(f"mean_prompt_tokens: {summary.mean_prompt_tokens:.1f}")
+
+
+def print_phase_breakdown(phase_breakdown: dict[str, PhaseSummary]) -> None:
+    if not phase_breakdown:
+        return
+
+    major_order = [
+        "lookup_total_s",
+        "blend_total_s",
+        "retrieve_total_s",
+        "blend_compute_only_s",
+    ]
+    detail_order = [
+        "retrieve_prepare_s",
+        "retrieve_storage_wait_s",
+        "retrieve_gpu_send_s",
+        "retrieve_other_s",
+        "to_gpu_total_s",
+        "to_gpu_buffer_load_copy_s",
+        "to_gpu_paged_kv_transfer_s",
+        "to_gpu_rope_recover_s",
+        "to_gpu_other_s",
+    ]
+
+    print("[online phase breakdown]")
+    for phase in major_order + detail_order:
+        summary = phase_breakdown.get(phase)
+        if summary is None:
+            continue
+        print(
+            f"{phase}: "
+            f"mean={summary.mean_s:.4f}, "
+            f"p50={summary.p50_s:.4f}, "
+            f"p90={summary.p90_s:.4f}, "
+            f"max={summary.max_s:.4f}, "
+            f"total={summary.total_s:.4f}"
+        )
 
 
 if __name__ == "__main__":
