@@ -55,7 +55,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        policy_name = self._resolve_cache_policy_name(config)
+        self.cache_policy = get_cache_policy(
+            policy_name,
+            backend_name=self.__class__.__name__,
+            config=config,
+            metadata=metadata,
+        )
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu
@@ -101,6 +107,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.warning("Controller message sender is not initialized")
 
         self._setup_metrics()
+
+    def _resolve_cache_policy_name(self, config: LMCacheEngineConfig) -> str:
+        extra_config = config.extra_config or {}
+        if self.__class__.__name__ == "LocalGPUBackend":
+            return extra_config.get("local_gpu.cache_policy", config.cache_policy)
+        return extra_config.get("local_cpu.cache_policy", config.cache_policy)
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -635,8 +647,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         if memory_objs is not None or not eviction:
             return memory_objs
-
-        assert isinstance(self.memory_allocator, MixedMemoryAllocator)
 
         evict_keys_count = 0
         num_attempts = 0
