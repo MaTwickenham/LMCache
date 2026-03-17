@@ -833,6 +833,15 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            load_tokens = tokens[:lmcache_cached_tokens]
+            load_slot_mapping = slot_mapping[:lmcache_cached_tokens]
+            load_token_mask = token_mask[:lmcache_cached_tokens]
+
+            # If vLLM already covers the entire reusable prefix at chunk
+            # granularity, there is nothing left for LMCache to load.
+            if lmcache_cached_tokens <= masked_token_count or not load_token_mask.any():
+                continue
+
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -842,19 +851,19 @@ class LMCacheConnectorV1Impl:
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        load_tokens,
+                        load_token_mask,
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=load_slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         req_id=request.req_id,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        load_tokens,
+                        load_token_mask,
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=load_slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                         req_id=request.req_id,
@@ -865,10 +874,10 @@ class LMCacheConnectorV1Impl:
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
+                    load_tokens,
+                    load_token_mask,
                     kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    slot_mapping=load_slot_mapping,
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     request_configs=request.request_configs,
                     req_id=request.req_id,
@@ -896,9 +905,9 @@ class LMCacheConnectorV1Impl:
                     """
                     missing_blocks = self.record_failed_blocks(
                         request.req_id,
-                        token_mask[:lmcache_cached_tokens],
+                        load_token_mask,
                         ret_token_mask,
-                        slot_mapping[:lmcache_cached_tokens],
+                        load_slot_mapping,
                     )
                     self._invalid_block_ids.update(missing_blocks)
 

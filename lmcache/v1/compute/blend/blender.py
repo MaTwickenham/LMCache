@@ -59,6 +59,53 @@ class LMCBlender:
             positions=None,
         )
 
+    def _get_current_old_kv(
+        self,
+        old_k_full: torch.Tensor,
+        old_v_full: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the old KV rows that correspond to the current hidden-state stream.
+
+        When sparse blending is active, the model only recomputes the important
+        token subset, but the connector still exposes full-window cached KV.
+        """
+        if self.metadata.imp_indices is None:
+            return old_k_full, old_v_full
+        return (
+            old_k_full[self.metadata.imp_indices],
+            old_v_full[self.metadata.imp_indices],
+        )
+
+    def _reset_attn_metadata_dense(
+        self,
+        attn_metadata: LMCAttnMetadata,
+        seq_len: int,
+        device: torch.device,
+    ) -> None:
+        """Best-effort reset for dense fallback paths.
+
+        LMCache currently uses FlashAttention metadata here; keep this guarded so
+        unsupported metadata implementations degrade safely.
+        """
+        if hasattr(attn_metadata, "query_start_loc"):
+            attn_metadata.query_start_loc = torch.tensor(
+                [0, seq_len],
+                dtype=torch.int32,
+                device=device,
+            )
+        if hasattr(attn_metadata, "seq_lens"):
+            attn_metadata.seq_lens = torch.tensor([seq_len], device=device)
+        if hasattr(attn_metadata, "cu_seqlens_k"):
+            attn_metadata.cu_seqlens_k = torch.tensor(
+                [0, seq_len],
+                dtype=torch.int32,
+                device=device,
+            )
+        if hasattr(attn_metadata, "max_query_len"):
+            attn_metadata.max_query_len = seq_len
+        if hasattr(attn_metadata, "max_seq_len"):
+            attn_metadata.max_seq_len = seq_len
+
     def process_qkv(
         self,
         q: torch.Tensor,
@@ -70,7 +117,7 @@ class LMCBlender:
         attn_metadata: LMCAttnMetadata,
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
-        old_k, old_v = self.gpu_connector.get_kv(layer_id)
+        old_k_full, old_v_full = self.gpu_connector.get_kv(layer_id)
 
         if attn_output is None:
             attn_output = torch.empty(
@@ -87,6 +134,27 @@ class LMCBlender:
         layer = self.layerwise_model.vllm_model.model.layers[layer_id]
         attn_layer = layer.self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
+
+        old_k, old_v = self._get_current_old_kv(old_k_full, old_v_full)
+
+        if old_k.shape[0] != k.shape[0] or old_v.shape[0] != v.shape[0]:
+            logger.warning(
+                "Blend shape mismatch at layer %s: current_k=%s old_k=%s "
+                "current_v=%s old_v=%s; falling back to fresh KV for this request.",
+                layer_id,
+                tuple(k.shape),
+                tuple(old_k.shape),
+                tuple(v.shape),
+                tuple(old_v.shape),
+            )
+            self.metadata.imp_indices = None
+            self.metadata.positions = torch.arange(
+                q.shape[0], device=q.device, dtype=torch.int64
+            )
+            self._reset_attn_metadata_dense(attn_metadata, q.shape[0], q.device)
+            if attn_output.shape[0] != q.shape[0]:
+                attn_output = attn_output[: q.shape[0]]
+            return q, k, v, residual, attn_output, attn_metadata
 
         if layer_id in self.common_metadata.check_layers:
             diff_k = torch.sum(
@@ -109,16 +177,19 @@ class LMCBlender:
 
             logger.debug(f"Number of indices picked: {len(top_indices)}")
 
-            self.metadata.imp_indices = top_indices
+            if self.metadata.imp_indices is None:
+                self.metadata.imp_indices = top_indices
+            else:
+                self.metadata.imp_indices = self.metadata.imp_indices[top_indices]
             self.metadata.positions = self.metadata.positions[top_indices]
             attn_output = attn_output[:topk_num]
 
             attn_metadata.update_from_top_indices(top_indices)
 
         if self.metadata.imp_indices is not None:
-            old_k[self.metadata.imp_indices] = k
-            old_v[self.metadata.imp_indices] = v
-            return q, old_k, old_v, residual, attn_output, attn_metadata
+            old_k_full[self.metadata.imp_indices] = k
+            old_v_full[self.metadata.imp_indices] = v
+            return q, old_k_full, old_v_full, residual, attn_output, attn_metadata
         else:
             return q, k, v, residual, attn_output, attn_metadata
 
