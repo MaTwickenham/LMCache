@@ -478,6 +478,9 @@ def launch_server(
     cuda_visible_devices: str | None,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
+    kv_cache_memory_bytes: int | None = None,
+    swap_space: float = 0.0,
+    cpu_offload_gb: float = 0.0,
     lmcache_env: dict[str, str] | None = None,
 ) -> Iterator[ServerProcess]:
     """Launch a vLLM server and tear it down automatically."""
@@ -512,7 +515,13 @@ def launch_server(
         dtype,
         "--disable-log-stats",
         "--enable-prompt-tokens-details",
+        "--swap-space",
+        str(swap_space),
+        "--cpu-offload-gb",
+        str(cpu_offload_gb),
     ]
+    if kv_cache_memory_bytes is not None:
+        cmd.extend(["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)])
     if enable_prefix_caching:
         cmd.append("--enable-prefix-caching")
     else:
