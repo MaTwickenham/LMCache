@@ -50,6 +50,7 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("decode_fast_prefsum", &decode_cuda_prefsum);
   m.def("calculate_cdf", &calculate_cdf);
   m.def("rotary_embedding_k_fused", &rotary_embedding_k_fused);
+  m.def("multi_fragment_copy_rope_kv_fused", &multi_fragment_copy_rope_kv_fused);
   m.def("alloc_pinned_ptr", &alloc_pinned_ptr,
         py::call_guard<py::gil_scoped_release>());
   m.def("free_pinned_ptr", &free_pinned_ptr);

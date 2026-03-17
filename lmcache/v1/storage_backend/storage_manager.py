@@ -109,6 +109,13 @@ def allocate_and_copy_objects(
 
         with torch.cuda.stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
+        if src_memory_obj.metadata.cached_positions is not None:
+            # Preserve cached fragment positions when replicating objects across
+            # tiers so retrieval sees the same RoPE metadata regardless of
+            # which backend served the fragment.
+            memory_obj.metadata.cached_positions = (
+                src_memory_obj.metadata.cached_positions
+            )
         allocated_objects.append(memory_obj)
 
     stream.synchronize()
