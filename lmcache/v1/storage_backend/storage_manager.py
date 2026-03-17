@@ -313,8 +313,10 @@ class StorageManager:
     ) -> AllocatorBackendInterface:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
-        else:
+        elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
+        else:
+            allocator_backend = self.storage_backends["LocalGPUBackend"]
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
@@ -531,6 +533,77 @@ class StorageManager:
             # TODO(Jiayi): need to make async loading and layerwise compatible
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            yield task
+
+    def layerwise_batched_get_multi_location(
+        self,
+        keys: List[List[CacheEngineKey]],
+        locations: List[str],
+    ) -> Generator[Future, None, None]:
+        """Retrieve one layer at a time while allowing spans to come from
+        different storage locations.
+
+        The returned future resolves to a list of MemoryObj aligned with the
+        original chunk order, so callers can continue to zip it with the
+        request's starts/ends without additional reordering.
+        """
+        if not keys:
+            return
+
+        async def gather_layer(
+            keys_multi_chunk: List[CacheEngineKey],
+        ) -> List[MemoryObj]:
+            grouped: OrderedDict[str, List[Tuple[int, CacheEngineKey]]] = OrderedDict()
+            for idx, (key, location) in enumerate(
+                zip(keys_multi_chunk, locations, strict=False)
+            ):
+                grouped.setdefault(location, []).append((idx, key))
+
+            results: List[Optional[MemoryObj]] = [None] * len(keys_multi_chunk)
+            tasks = []
+            grouped_items = []
+            for location, indexed_keys in grouped.items():
+                backend = self.storage_backends[location]
+                grouped_items.append((location, indexed_keys))
+                tasks.append(
+                    backend.batched_get_non_blocking(
+                        "fake_lookup_id",
+                        [key for _, key in indexed_keys],
+                    )
+                )
+
+            gathered = await asyncio.gather(*tasks)
+            for (location, indexed_keys), memory_objs in zip(
+                grouped_items, gathered, strict=False
+            ):
+                if len(memory_objs) != len(indexed_keys):
+                    raise RuntimeError(
+                        "Layerwise multi-location retrieval returned an "
+                        f"unexpected number of objects from {location}: "
+                        f"expected {len(indexed_keys)}, got {len(memory_objs)}"
+                    )
+                for (idx, _), memory_obj in zip(
+                    indexed_keys, memory_objs, strict=False
+                ):
+                    results[idx] = memory_obj
+
+            if any(memory_obj is None for memory_obj in results):
+                raise RuntimeError(
+                    "Layerwise multi-location retrieval produced incomplete results"
+                )
+
+            return cast(List[MemoryObj], results)
+
+        for keys_multi_chunk in keys:
+            if len(keys_multi_chunk) != len(locations):
+                raise ValueError(
+                    "keys and locations must have the same chunk count in "
+                    "layerwise_batched_get_multi_location"
+                )
+            task = asyncio.run_coroutine_threadsafe(
+                gather_layer(keys_multi_chunk),
+                self.loop,
+            )
             yield task
 
     def prefetch_single_done_callback(
@@ -977,9 +1050,10 @@ class StorageManager:
         return block_mapping
 
     def touch_cache(self):
-        for backend_name, backend in self.storage_backends.items():
-            if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
-                backend.touch_cache()
+        for _, backend in self.storage_backends.items():
+            touch = getattr(backend, "touch_cache", None)
+            if touch is not None:
+                touch()
 
     def remove(
         self,

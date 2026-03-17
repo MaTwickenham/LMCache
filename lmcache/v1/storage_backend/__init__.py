@@ -15,6 +15,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.local_gpu_backend import LocalGPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
@@ -150,8 +151,30 @@ def CreateStorageBackends(
         if isinstance(_existing_cpu, LocalCPUBackend):
             local_cpu_backend = _existing_cpu
 
+    local_gpu_backend: Optional[LocalGPUBackend] = None
+    if existing_backends and "LocalGPUBackend" in existing_backends:
+        _existing_gpu = existing_backends["LocalGPUBackend"]
+        if isinstance(_existing_gpu, LocalGPUBackend):
+            local_gpu_backend = _existing_gpu
+
     if metadata.role == "scheduler":
-        # For scheduler role, local_cpu_backend is None
+        # For scheduler role, local backends are not created.
+        pass
+    elif config.local_gpu and config.max_local_gpu_size > 0:
+        if "LocalGPUBackend" in _skip:
+            pass
+        elif not torch.cuda.is_available():
+            logger.warning("Skipping LocalGPUBackend because CUDA is not available")
+        else:
+            local_gpu_backend = LocalGPUBackend(
+                config,
+                metadata,
+                dst_device,
+                lmcache_worker,
+            )
+            storage_backends[str(local_gpu_backend)] = local_gpu_backend
+
+    if metadata.role == "scheduler":
         pass
     elif not config.enable_pd or config.local_cpu:
         if "LocalCPUBackend" in _skip:

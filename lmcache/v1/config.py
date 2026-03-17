@@ -69,6 +69,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
+    "local_gpu": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "max_local_gpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
         "type": Optional[str],
         "default": None,
@@ -582,7 +588,7 @@ def _log_config(self):
     config_dict = {}
     for name in _CONFIG_DEFINITIONS:
         value = getattr(self, name)
-        if name in ["max_local_cpu_size", "max_local_disk_size"]:
+        if name in ["max_local_cpu_size", "max_local_gpu_size", "max_local_disk_size"]:
             value = f"{value} GB"
         config_dict[name] = value
 

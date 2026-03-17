@@ -942,13 +942,13 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        locations = []
         retrieve_prepare_start = time.perf_counter()
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        location = None
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -958,23 +958,17 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(keys_multi_layer[0]):
-                if location is None:
-                    location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
-                    )
-            else:
+            # NOTE: Only check the first layer. Each fragment is still expected
+            # to live in a single backend, but different fragments may now come
+            # from different locations.
+            current_location = self.storage_manager.contains(keys_multi_layer[0])
+            if current_location is None:
                 break
 
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
+            locations.append(current_location)
 
             ret_mask[start:end] = True
 
@@ -993,10 +987,16 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
-            )
+            if len(set(locations)) == 1:
+                get_generator = self.storage_manager.layerwise_batched_get(
+                    keys_layer_major,
+                    location=locations[0],
+                )
+            else:
+                get_generator = self.storage_manager.layerwise_batched_get_multi_location(
+                    keys_layer_major,
+                    locations,
+                )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
