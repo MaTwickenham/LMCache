@@ -476,6 +476,8 @@ def launch_server(
     startup_timeout_s: float,
     enforce_eager: bool,
     cuda_visible_devices: str | None,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
     lmcache_env: dict[str, str] | None = None,
 ) -> Iterator[ServerProcess]:
     """Launch a vLLM server and tear it down automatically."""
@@ -515,6 +517,10 @@ def launch_server(
         cmd.append("--enable-prefix-caching")
     else:
         cmd.append("--no-enable-prefix-caching")
+    if max_num_seqs is not None:
+        cmd.extend(["--max-num-seqs", str(max_num_seqs)])
+    if max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(max_num_batched_tokens)])
     if enforce_eager:
         cmd.append("--enforce-eager")
     if enable_blend:

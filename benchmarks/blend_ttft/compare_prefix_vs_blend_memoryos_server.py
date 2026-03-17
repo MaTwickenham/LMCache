@@ -46,6 +46,7 @@ FRAGMENT_ORDER_POLICY_CHOICES = (
     "profile_last",
     "profile_last_shuffle",
 )
+BLEND_BACKEND_CHOICES = ("cpu", "gpu")
 
 
 @dataclass
@@ -104,6 +105,7 @@ class PrefillSummary:
 
 @dataclass
 class BlendChunkResult:
+    backend: str
     chunk_size: int
     prefill: PrefillSummary
     online: LatencySummary
@@ -154,7 +156,7 @@ class BenchmarkResult:
     workload: WorkloadStats
     no_prefix: LatencySummary
     native_prefix: LatencySummary
-    blend_cpu_results: list[BlendChunkResult]
+    blend_results: list[BlendChunkResult]
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,6 +219,12 @@ def parse_args() -> argparse.Namespace:
         default="512,256,128",
         help="Comma-separated LMCache chunk sizes to test.",
     )
+    parser.add_argument(
+        "--blend-backends",
+        type=str,
+        default="cpu",
+        help="Comma-separated LMCache backends to test from {cpu,gpu}.",
+    )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--warmup-query-text", type=str, default="Warm up the engine.")
     parser.add_argument(
@@ -230,10 +238,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blend-special-str", type=str, default="# #")
     parser.add_argument("--system-prompt", type=str, default="")
     parser.add_argument("--max-local-cpu-size", type=float, default=8.0)
+    parser.add_argument("--max-local-gpu-size", type=float, default=4.0)
     parser.add_argument("--blend-check-layers", type=str, default="1")
     parser.add_argument("--blend-recompute-ratios", type=str, default="0.15")
     parser.add_argument("--port", type=int, default=8013)
     parser.add_argument("--startup-timeout-s", type=float, default=240.0)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Optional vLLM max_num_seqs override for constrained GPUs.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Optional vLLM max_num_batched_tokens override for constrained GPUs.",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--cuda-visible-devices", type=str, default=None)
     parser.add_argument("--output-json", type=str, default=None)
@@ -250,6 +271,7 @@ def main() -> None:
     chunk_sizes = [int(value) for value in args.chunk_sizes.split(",") if value]
     if not chunk_sizes:
         raise ValueError("chunk_sizes cannot be empty.")
+    blend_backends = parse_blend_backends(args.blend_backends)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     workload = build_memoryos_workload(
@@ -286,17 +308,19 @@ def main() -> None:
         enable_blend=False,
     )
 
-    blend_cpu_results: list[BlendChunkResult] = []
-    for chunk_size in chunk_sizes:
-        blend_cpu_results.append(
-            run_blend_cpu_workload(
-                args=args,
-                query_records=workload["query_records"],
-                prefill_records=workload["prefill_records"],
-                warmup_prompt_ids=workload["warmup_prompt_ids"],
-                chunk_size=chunk_size,
+    blend_results: list[BlendChunkResult] = []
+    for backend in blend_backends:
+        for chunk_size in chunk_sizes:
+            blend_results.append(
+                run_blend_workload(
+                    args=args,
+                    query_records=workload["query_records"],
+                    prefill_records=workload["prefill_records"],
+                    warmup_prompt_ids=workload["warmup_prompt_ids"],
+                    chunk_size=chunk_size,
+                    backend=backend,
+                )
             )
-        )
 
     result = BenchmarkResult(
         model=str(args.model),
@@ -304,7 +328,7 @@ def main() -> None:
         workload=workload["stats"],
         no_prefix=no_prefix,
         native_prefix=native_prefix,
-        blend_cpu_results=blend_cpu_results,
+        blend_results=blend_results,
     )
 
     print_result(result)
@@ -321,6 +345,19 @@ def parse_datasets(raw: str) -> list[str]:
     if not datasets:
         raise ValueError("datasets cannot be empty.")
     return datasets
+
+
+def parse_blend_backends(raw: str) -> list[str]:
+    backends = [item.strip().lower() for item in str(raw).split(",") if item.strip()]
+    if not backends:
+        raise ValueError("blend_backends cannot be empty.")
+    invalid = [item for item in backends if item not in BLEND_BACKEND_CHOICES]
+    if invalid:
+        raise ValueError(
+            f"Unsupported blend backend(s): {invalid}. "
+            f"Expected a subset of {list(BLEND_BACKEND_CHOICES)}."
+        )
+    return backends
 
 
 def build_memoryos_workload(
@@ -838,6 +875,8 @@ def run_online_workload(
         startup_timeout_s=args.startup_timeout_s,
         enforce_eager=args.enforce_eager,
         cuda_visible_devices=args.cuda_visible_devices,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         lmcache_env=lmcache_env,
     ) as server:
         measure_streaming_request(
@@ -876,13 +915,46 @@ def run_online_workload(
     )
 
 
-def run_blend_cpu_workload(
+def build_blend_lmcache_env(
+    *,
+    args: argparse.Namespace,
+    chunk_size: int,
+    backend: str,
+    phase_file: Path,
+) -> dict[str, str]:
+    env = {
+        "LMCACHE_CHUNK_SIZE": str(chunk_size),
+        "LMCACHE_ENABLE_BLENDING": "True",
+        "LMCACHE_BLEND_SPECIAL_STR": str(args.blend_special_str),
+        "LMCACHE_SAVE_UNFULL_CHUNK": "True",
+        "LMCACHE_USE_LAYERWISE": "True",
+        "LMCACHE_BLEND_CHECK_LAYERS": str(args.blend_check_layers),
+        "LMCACHE_BLEND_RECOMPUTE_RATIOS": str(args.blend_recompute_ratios),
+        "LMCACHE_PHASE_TIMING_PATH": str(phase_file),
+        "LMCACHE_LOCAL_CPU": "False",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": "0",
+        "LMCACHE_LOCAL_GPU": "False",
+        "LMCACHE_MAX_LOCAL_GPU_SIZE": "0",
+    }
+    if backend == "cpu":
+        env["LMCACHE_LOCAL_CPU"] = "True"
+        env["LMCACHE_MAX_LOCAL_CPU_SIZE"] = str(args.max_local_cpu_size)
+    elif backend == "gpu":
+        env["LMCACHE_LOCAL_GPU"] = "True"
+        env["LMCACHE_MAX_LOCAL_GPU_SIZE"] = str(args.max_local_gpu_size)
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+    return env
+
+
+def run_blend_workload(
     *,
     args: argparse.Namespace,
     query_records: list[QueryRecord],
     prefill_records: list[PrefillRecord],
     warmup_prompt_ids: list[int],
     chunk_size: int,
+    backend: str,
 ) -> BlendChunkResult:
     import requests
     import time
@@ -891,7 +963,7 @@ def run_blend_cpu_workload(
     session.trust_env = False
     phase_file = Path(
         tempfile.NamedTemporaryFile(
-            prefix=f"lmcache_phase_chunk{chunk_size}_",
+            prefix=f"lmcache_{backend}_phase_chunk{chunk_size}_",
             suffix=".jsonl",
             delete=False,
         ).name
@@ -900,18 +972,12 @@ def run_blend_cpu_workload(
     prefill_measurements: list[RequestMeasurement] = []
     query_measurements: list[RequestMeasurement] = []
 
-    lmcache_env = {
-        "LMCACHE_CHUNK_SIZE": str(chunk_size),
-        "LMCACHE_LOCAL_CPU": "True",
-        "LMCACHE_MAX_LOCAL_CPU_SIZE": str(args.max_local_cpu_size),
-        "LMCACHE_ENABLE_BLENDING": "True",
-        "LMCACHE_BLEND_SPECIAL_STR": str(args.blend_special_str),
-        "LMCACHE_SAVE_UNFULL_CHUNK": "True",
-        "LMCACHE_USE_LAYERWISE": "True",
-        "LMCACHE_BLEND_CHECK_LAYERS": str(args.blend_check_layers),
-        "LMCACHE_BLEND_RECOMPUTE_RATIOS": str(args.blend_recompute_ratios),
-        "LMCACHE_PHASE_TIMING_PATH": str(phase_file),
-    }
+    lmcache_env = build_blend_lmcache_env(
+        args=args,
+        chunk_size=chunk_size,
+        backend=backend,
+        phase_file=phase_file,
+    )
 
     with launch_server(
         model=args.model,
@@ -924,6 +990,8 @@ def run_blend_cpu_workload(
         startup_timeout_s=args.startup_timeout_s,
         enforce_eager=args.enforce_eager,
         cuda_visible_devices=args.cuda_visible_devices,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         lmcache_env=lmcache_env,
     ) as server:
         measure_streaming_request(
@@ -977,6 +1045,7 @@ def run_blend_cpu_workload(
             except Exception as exc:
                 raise RuntimeError(
                     "Blend online query failed.\n"
+                    f"backend={backend}\n"
                     f"chunk_size={chunk_size}\n"
                     f"dataset={record.dataset}\n"
                     f"qa_index={record.qa_index}\n"
@@ -1004,6 +1073,7 @@ def run_blend_cpu_workload(
     if query_measurements:
         first_query_ttft_s = query_measurements[0].ttft_s or 0.0
     return BlendChunkResult(
+        backend=backend,
         chunk_size=chunk_size,
         prefill=prefill_summary,
         online=online_summary,
@@ -1251,9 +1321,11 @@ def print_result(result: BenchmarkResult) -> None:
     print_mode_summary("plain vLLM (no prefix)", result.no_prefix)
     print_mode_summary("native vLLM prefix caching", result.native_prefix)
 
-    for item in result.blend_cpu_results:
+    for item in result.blend_results:
         print()
-        print(f"[LMCache CacheBlend CPU chunk={item.chunk_size}]")
+        print(
+            f"[LMCache CacheBlend {item.backend.upper()} chunk={item.chunk_size}]"
+        )
         print(
             "prefill: "
             f"requests={item.prefill.request_count}, "
