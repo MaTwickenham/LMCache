@@ -121,17 +121,21 @@ def _parse_quoted_string(value: str) -> str:
     if not value:
         return value
 
-    value = value.strip()
+    stripped = value.strip()
 
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+    if (
+        len(stripped) >= 2
+        and stripped[0] == stripped[-1]
+        and stripped[0] in ("'", '"')
+    ):
         try:
-            evaluated = ast.literal_eval(value)
+            evaluated = ast.literal_eval(stripped)
             if isinstance(evaluated, str):
                 return evaluated
         except (ValueError, SyntaxError):
             # If ast.literal_eval fails, it's not a valid Python literal.
             # Fall back to simply stripping the outer quotes.
-            return value[1:-1]
+            return stripped[1:-1]
 
     return value
 

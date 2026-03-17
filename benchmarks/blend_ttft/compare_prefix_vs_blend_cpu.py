@@ -17,6 +17,7 @@ including the fragment-prefill preparation phase.
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import math
@@ -291,6 +292,7 @@ def run_blend_cpu_benchmark(
         "LMCACHE_MAX_LOCAL_CPU_SIZE": str(max_local_cpu_size),
         "LMCACHE_ENABLE_BLENDING": "True",
         "LMCACHE_BLEND_SPECIAL_STR": blend_special_str,
+        "LMCACHE_SAVE_UNFULL_CHUNK": "True",
         "LMCACHE_USE_LAYERWISE": "True",
         "LMCACHE_BLEND_CHECK_LAYERS": blend_check_layers,
         "LMCACHE_BLEND_RECOMPUTE_RATIOS": blend_recompute_ratios,
@@ -306,15 +308,28 @@ def run_blend_cpu_benchmark(
         ) as llm:
             measure_request(llm, warmup_prompt_ids, sampling_params)
 
+            prefill_sampling_params = with_lmcache_request_kind(
+                sampling_params,
+                "fragment_prefill",
+            )
+            query_sampling_params = with_lmcache_request_kind(
+                sampling_params,
+                "online_blended_query",
+            )
+
             prefill_measurements: list[RequestMeasurement] = []
             prefill_start = time.perf_counter()
             for prompt_ids in prefill_prompt_ids:
                 prefill_measurements.append(
-                    measure_request(llm, prompt_ids, sampling_params)
+                    measure_request(llm, prompt_ids, prefill_sampling_params)
                 )
             prefill_wall_s = time.perf_counter() - prefill_start
 
-            final_request = measure_request(llm, final_prompt_ids, sampling_params)
+            final_request = measure_request(
+                llm,
+                final_prompt_ids,
+                query_sampling_params,
+            )
 
     return {
         "prefill_requests": len(prefill_prompt_ids),
@@ -473,6 +488,21 @@ def measure_request(
         num_cached_tokens=output.num_cached_tokens,
         generated_text=output.outputs[0].text,
     )
+
+
+def with_lmcache_request_kind(
+    sampling_params: SamplingParams,
+    request_kind: str,
+) -> SamplingParams:
+    """Clone sampling params and tag the request for LMCache routing."""
+
+    cloned = copy.deepcopy(sampling_params)
+    extra_args = dict(cloned.extra_args or {})
+    kv_transfer_params = dict(extra_args.get("kv_transfer_params") or {})
+    kv_transfer_params["lmcache.request_kind"] = request_kind
+    extra_args["kv_transfer_params"] = kv_transfer_params
+    cloned.extra_args = extra_args
+    return cloned
 
 
 def patch_blend_model_registration() -> None:

@@ -46,6 +46,7 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
     from lmcache.v1.gpu_connector.gpu_connectors import (
         SGLangLayerwiseGPUConnector,
         VLLMBufferLayerwiseGPUConnector,
+        VLLMFastBlendLayerwiseGPUConnector,
         VLLMPagedMemLayerwiseGPUConnector,
     )
 
@@ -54,6 +55,7 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
         (
             VLLMPagedMemLayerwiseGPUConnector,
             VLLMBufferLayerwiseGPUConnector,
+            VLLMFastBlendLayerwiseGPUConnector,
             SGLangLayerwiseGPUConnector,
         ),
     )

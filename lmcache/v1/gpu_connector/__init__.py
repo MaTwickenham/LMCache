@@ -61,6 +61,7 @@ def CreateGPUConnector(
         # First Party
         from lmcache.v1.gpu_connector.gpu_connectors import (
             VLLMBufferLayerwiseGPUConnector,
+            VLLMFastBlendLayerwiseGPUConnector,
             VLLMPagedMemGPUConnectorV2,
             VLLMPagedMemGPUConnectorV3,
             VLLMPagedMemLayerwiseGPUConnector,
@@ -73,8 +74,21 @@ def CreateGPUConnector(
 
         if config.use_layerwise:
             if config.enable_blending:
-                return VLLMBufferLayerwiseGPUConnector.from_metadata(
-                    metadata, use_gpu, device
+                blend_connector_impl = (config.extra_config or {}).get(
+                    "blend_connector_impl",
+                    "fast",
+                )
+                if blend_connector_impl == "legacy":
+                    return VLLMBufferLayerwiseGPUConnector.from_metadata(
+                        metadata, use_gpu, device
+                    )
+                if blend_connector_impl == "fast":
+                    return VLLMFastBlendLayerwiseGPUConnector.from_metadata(
+                        metadata, use_gpu, device
+                    )
+                raise ValueError(
+                    f"Unknown blend_connector_impl={blend_connector_impl!r}. "
+                    "Expected 'fast' or 'legacy'."
                 )
             else:
                 return VLLMPagedMemLayerwiseGPUConnector.from_metadata(
