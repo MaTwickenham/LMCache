@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -74,6 +75,22 @@ ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 
 class CacheEngineEndSignal:
     pass
+
+
+@dataclass(frozen=True)
+class SparseLookupSpan:
+    start: int
+    end: int
+    location: str
+    keys_multi_layer: List[CacheEngineKey]
+
+
+@dataclass
+class SparseLookupPlan:
+    window_start: int
+    window_end: int
+    reused_token_count: int
+    hit_spans: List[SparseLookupSpan]
 
 
 class LMCacheEngine:
@@ -200,6 +217,7 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self.lookup_plans: dict[str, SparseLookupPlan] = {}
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -694,6 +712,19 @@ class LMCacheEngine:
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        request_kind = "unknown"
+        if isinstance(request_configs, dict):
+            request_kind = str(request_configs.get("lmcache.request_kind", "unknown"))
+        record_phase(
+            req_id,
+            "store_plan_s",
+            0.0,
+            request_kind=request_kind,
+            prompt_tokens=len(tokens),
+            store_segments=len(keys),
+            store_tokens=tot_token_num,
+        )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -886,6 +917,258 @@ class LMCacheEngine:
             )
         return ret_mask
 
+    def _should_use_sparse_blend_lookup(
+        self,
+        lookup_mode: Optional[str],
+        lookup_id: Optional[str],
+        pin: bool,
+    ) -> bool:
+        return (
+            lookup_mode == "sparse_blend_window"
+            and self.use_layerwise
+            and self.config.enable_blending
+            and pin
+            and lookup_id is not None
+        )
+
+    def _lookup_sparse_blend_window(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        search_range: Optional[List[str]],
+        lookup_id: str,
+        pin: bool,
+        request_configs: Optional[dict],
+    ) -> int:
+        assert self.storage_manager is not None
+
+        hit_spans: List[SparseLookupSpan] = []
+        window_end = 0
+        reused_token_count = 0
+
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            key_all_layers = key.split_layers(self.num_layers)
+            hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                key_all_layers,  # type: ignore[arg-type]
+                search_range,
+                pin,
+            )
+            if hit_chunks != self.num_layers or len(block_mapping) != 1:
+                continue
+
+            location = next(iter(block_mapping.keys()))
+            if pin:
+                self.lookup_pins[lookup_id][location].extend(key_all_layers)
+
+            hit_spans.append(
+                SparseLookupSpan(
+                    start=start,
+                    end=end,
+                    location=location,
+                    keys_multi_layer=key_all_layers,
+                )
+            )
+            window_end = end
+            reused_token_count += end - start
+
+        if hit_spans:
+            self.lookup_plans[lookup_id] = SparseLookupPlan(
+                window_start=0,
+                window_end=window_end,
+                reused_token_count=reused_token_count,
+                hit_spans=hit_spans,
+            )
+            record_phase(
+                lookup_id,
+                "lookup_sparse_plan_s",
+                0.0,
+                hit_spans=len(hit_spans),
+                reused_tokens=reused_token_count,
+                window_end=window_end,
+                prompt_tokens=len(tokens),
+            )
+            logger.debug(
+                "Sparse blend lookup built %d hit spans for %s: reused=%d, window_end=%d",
+                len(hit_spans),
+                lookup_id,
+                reused_token_count,
+                window_end,
+            )
+            return window_end
+
+        self.lookup_plans.pop(lookup_id, None)
+        record_phase(
+            lookup_id,
+            "lookup_sparse_plan_s",
+            0.0,
+            hit_spans=0,
+            reused_tokens=0,
+            window_end=0,
+            prompt_tokens=len(tokens),
+        )
+        return 0
+
+    def _retrieve_layer_by_plan(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        plan: SparseLookupPlan,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+
+        req_id = self._get_req_id(kwargs)
+        retrieve_start = time.perf_counter()
+        dense_window_end = min(plan.window_end, len(tokens))
+        if dense_window_end < plan.window_end:
+            logger.warning(
+                "[req_id=%s] Sparse lookup plan window clipped from %d to %d tokens.",
+                req_id,
+                plan.window_end,
+                dense_window_end,
+            )
+
+        monitor_req_id = self.stats_monitor.on_retrieve_request(dense_window_end)
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        starts: list[int] = []
+        ends: list[int] = []
+        keys: list[List[CacheEngineKey]] = []
+        locations: list[str] = []
+        retrieve_prepare_start = time.perf_counter()
+
+        for span in plan.hit_spans:
+            if span.start >= dense_window_end:
+                break
+            if span.end > dense_window_end:
+                logger.warning(
+                    "[req_id=%s] Skip partially clipped sparse span [%d, %d).",
+                    req_id,
+                    span.start,
+                    span.end,
+                )
+                continue
+
+            starts.append(span.start)
+            ends.append(span.end)
+            keys.append(span.keys_multi_layer)
+            locations.append(span.location)
+            ret_mask[span.start : span.end] = True
+
+        record_phase(
+            req_id,
+            "retrieve_sparse_plan_s",
+            0.0,
+            plan_hit_spans=len(plan.hit_spans),
+            selected_spans=len(keys),
+            plan_reused_tokens=plan.reused_token_count,
+            plan_window_end=plan.window_end,
+            dense_window_end=dense_window_end,
+        )
+
+        record_phase(
+            req_id,
+            "retrieve_prepare_s",
+            time.perf_counter() - retrieve_prepare_start,
+            cached_tokens=dense_window_end,
+            retrieved_spans=len(keys),
+        )
+
+        storage_wait_s = 0.0
+        gpu_send_s = 0.0
+        mem_obj_consumer = None
+        if keys:
+            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+
+            if len(set(locations)) == 1:
+                get_generator = self.storage_manager.layerwise_batched_get(
+                    keys_layer_major,
+                    location=locations[0],
+                )
+            else:
+                get_generator = self.storage_manager.layerwise_batched_get_multi_location(
+                    keys_layer_major,
+                    locations,
+                )
+
+            assert_layerwise_gpu_connector(self.gpu_connector)
+
+            consumer_kwargs = dict(kwargs)
+            consumer_kwargs["dense_window_start"] = plan.window_start
+            consumer_kwargs["dense_window_end"] = dense_window_end
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                starts,
+                ends,
+                **consumer_kwargs,
+            )
+            next(mem_obj_consumer)
+
+            to_count_down = []
+            for layer_id in range(self.num_layers):
+                task = next(get_generator)
+
+                assert task is not None
+
+                if layer_id == 0:
+                    yield torch.sum(ret_mask)
+                else:
+                    yield None
+
+                storage_wait_start = time.perf_counter()
+                mem_objs_layer = task.result()
+                storage_wait_s += time.perf_counter() - storage_wait_start
+
+                gpu_send_start = time.perf_counter()
+                mem_obj_consumer.send(mem_objs_layer)
+                gpu_send_s += time.perf_counter() - gpu_send_start
+                to_count_down.extend(mem_objs_layer)
+
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
+        else:
+            for _ in range(self.num_layers):
+                yield None
+
+        yield None
+
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
+
+        retrieved_tokens = torch.sum(ret_mask)
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        record_phase(
+            req_id,
+            "retrieve_storage_wait_s",
+            storage_wait_s,
+            cached_tokens=int(retrieved_tokens),
+        )
+        record_phase(
+            req_id,
+            "retrieve_gpu_send_s",
+            gpu_send_s,
+            cached_tokens=int(retrieved_tokens),
+        )
+        record_phase(
+            req_id,
+            "retrieve_total_s",
+            time.perf_counter() - retrieve_start,
+            cached_tokens=int(retrieved_tokens),
+        )
+        if not self._is_passive():
+            logger.info(
+                "[req_id=%s] Retrieved %d sparse-hit tokens inside dense window %d",
+                req_id,
+                retrieved_tokens,
+                dense_window_end,
+            )
+
+        yield ret_mask
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def retrieve_layer(
@@ -929,6 +1212,10 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        if self.config.enable_blending and req_id in self.lookup_plans:
+            yield from self._retrieve_layer_by_plan(tokens, self.lookup_plans[req_id], **kwargs)
+            return
+
         retrieve_start = time.perf_counter()
 
         if mask is not None:
@@ -1080,6 +1367,7 @@ class LMCacheEngine:
         lookup_id: Optional[str] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -1122,6 +1410,20 @@ class LMCacheEngine:
 
         res = 0
         try:
+            if (
+                tokens is not None
+                and self._should_use_sparse_blend_lookup(lookup_mode, lookup_id, pin)
+            ):
+                assert lookup_id is not None
+                res = self._lookup_sparse_blend_window(
+                    tokens=tokens,
+                    search_range=search_range,
+                    lookup_id=lookup_id,
+                    pin=pin,
+                    request_configs=request_configs,
+                )
+                return res
+
             chunk_info_iterator = self.token_database.process_tokens(
                 tokens=tokens,
                 hashes=hashes,
@@ -1459,6 +1761,7 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
+        self.lookup_plans.pop(lookup_id, None)
         if lookup_id in self.lookup_pins:
             assert self.storage_manager is not None
             for location, keys in self.lookup_pins.pop(lookup_id).items():

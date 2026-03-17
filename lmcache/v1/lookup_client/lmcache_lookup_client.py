@@ -88,10 +88,12 @@ class LMCacheLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> Optional[int]:
         request_configs_str = ""
         if request_configs is not None and len(request_configs) != 0:
             request_configs_str = json.dumps(request_configs)
+        lookup_mode_str = lookup_mode or ""
 
         # NOTE(Jiayi): We cannot only send hashes when
         # blending enabled because the blender need the
@@ -118,6 +120,7 @@ class LMCacheLookupClient(LookupClientInterface):
                 offsets,
                 lookup_id,
                 request_configs_str,
+                lookup_mode_str,
             ]
         else:
             if isinstance(token_ids, torch.Tensor):
@@ -128,6 +131,7 @@ class LMCacheLookupClient(LookupClientInterface):
                 token_ids,
                 lookup_id,
                 request_configs_str,
+                lookup_mode_str,
             ]
 
         responses = self.transport.send_and_recv_all(msg_buf)
@@ -197,13 +201,29 @@ class LMCacheLookupServer:
                     identity, data_frames = result
 
                     # Validate frame structure
-                    if len(data_frames) < 3:
+                    min_frames = 3 if self.enable_blending else 4
+                    if len(data_frames) < min_frames:
                         logger.warning("Malformed request received: not enough frames.")
                         continue
 
                     # Validate and decode lookup_id
-                    lookup_id_bytes = data_frames[-2]
-                    request_configs_bytes = data_frames[-1]
+                    lookup_mode_bytes = b""
+                    if self.enable_blending:
+                        if len(data_frames) >= 4:
+                            lookup_id_bytes = data_frames[-3]
+                            request_configs_bytes = data_frames[-2]
+                            lookup_mode_bytes = data_frames[-1]
+                        else:
+                            lookup_id_bytes = data_frames[-2]
+                            request_configs_bytes = data_frames[-1]
+                    else:
+                        if len(data_frames) >= 5:
+                            lookup_id_bytes = data_frames[-3]
+                            request_configs_bytes = data_frames[-2]
+                            lookup_mode_bytes = data_frames[-1]
+                        else:
+                            lookup_id_bytes = data_frames[-2]
+                            request_configs_bytes = data_frames[-1]
 
                     if not isinstance(lookup_id_bytes, (bytes, str)):
                         logger.warning(
@@ -215,6 +235,11 @@ class LMCacheLookupServer:
                         logger.warning(
                             "Malformed request received: "
                             "request_configs is not bytes or str."
+                        )
+                        continue
+                    if not isinstance(lookup_mode_bytes, (bytes, str)):
+                        logger.warning(
+                            "Malformed request received: lookup_mode is not bytes or str."
                         )
                         continue
 
@@ -229,6 +254,11 @@ class LMCacheLookupServer:
                     else:
                         request_configs_str = request_configs_bytes
 
+                    if isinstance(lookup_mode_bytes, bytes):
+                        lookup_mode = lookup_mode_bytes.decode("utf-8")
+                    else:
+                        lookup_mode = lookup_mode_bytes
+
                     request_configs = (
                         json.loads(request_configs_str) if request_configs_str else None
                     )
@@ -242,6 +272,7 @@ class LMCacheLookupServer:
                             lookup_id=lookup_id,
                             pin=True,
                             request_configs=request_configs,
+                            lookup_mode=lookup_mode or None,
                         )
                     else:
                         tokens = data_frames[0]
@@ -250,6 +281,7 @@ class LMCacheLookupServer:
                             lookup_id=lookup_id,
                             pin=True,
                             request_configs=request_configs,
+                            lookup_mode=lookup_mode or None,
                         )
                     response = lookup_result.to_bytes(4, "big")
                     self.transport.send_response(identity, response)

@@ -195,7 +195,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> Optional[int]:
+        if lookup_mode is not None:
+            logger.warning(
+                "LMCacheAsyncLookupClient ignores lookup_mode=%s; async sparse "
+                "blend lookup is not supported on this path.",
+                lookup_mode,
+            )
         hashes: list[int] = []
         offsets = []
         for start, end, hash_val in self.token_database.process_tokens(

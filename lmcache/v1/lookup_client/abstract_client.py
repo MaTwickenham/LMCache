@@ -30,6 +30,7 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> Optional[int]:
         """
         Perform lookup for the given token IDs.
@@ -46,6 +47,9 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
 
             request_configs: The configs of the request,
             includes tags and the other configs
+
+            lookup_mode: Optional control-plane mode for the lookup path.
+            This must not affect cache-key generation.
 
         Returns:
             The number of tokens that exist inside LMCache.

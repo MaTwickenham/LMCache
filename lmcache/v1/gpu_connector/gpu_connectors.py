@@ -1167,9 +1167,21 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         starts: List[int],
         ends: List[int],
         slot_mapping: torch.Tensor,
+        dense_window_start: Optional[int] = None,
+        dense_window_end: Optional[int] = None,
     ) -> BlendTransferPlan:
-        buffer_offset = starts[0]
-        num_all_tokens = ends[-1] - buffer_offset
+        buffer_offset = starts[0] if dense_window_start is None else dense_window_start
+        window_end = ends[-1] if dense_window_end is None else dense_window_end
+        if buffer_offset > starts[0]:
+            raise ValueError(
+                "dense_window_start cannot be greater than the first retrieved span"
+            )
+        if window_end < ends[-1]:
+            raise ValueError(
+                "dense_window_end cannot be smaller than the last retrieved span"
+            )
+
+        num_all_tokens = window_end - buffer_offset
         gap_mask = torch.ones(
             num_all_tokens,
             dtype=torch.bool,
@@ -1203,7 +1215,7 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         return BlendTransferPlan(
             buffer_offset=buffer_offset,
             buffer_shape=self.get_shape(num_all_tokens),
-            slot_mapping_full=slot_mapping[buffer_offset : ends[-1]],
+            slot_mapping_full=slot_mapping[buffer_offset:window_end],
             gap_positions=gap_positions,
             spans=spans,
             dst_starts_tensor=torch.tensor(
@@ -1430,7 +1442,13 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
             self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
 
         self._lazy_initialize_buffer(self.kvcaches)
-        transfer_plan = self._build_transfer_plan(starts, ends, slot_mapping)
+        transfer_plan = self._build_transfer_plan(
+            starts,
+            ends,
+            slot_mapping,
+            dense_window_start=kwargs.get("dense_window_start"),
+            dense_window_end=kwargs.get("dense_window_end"),
+        )
 
         buffer_objs = self._acquire_layer_buffers(transfer_plan.buffer_shape)
 

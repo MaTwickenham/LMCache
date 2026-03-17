@@ -42,12 +42,14 @@ class HitLimitLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> Optional[int]:
         # get real hit tokens
         result = self.actual_lookup_client.lookup(
             token_ids,
             lookup_id,
             request_configs,
+            lookup_mode,
         )
         if result is not None:
             total_tokens_length = len(token_ids)

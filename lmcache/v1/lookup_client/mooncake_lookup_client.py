@@ -54,7 +54,12 @@ class MooncakeLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
+        lookup_mode: Optional[str] = None,
     ) -> Optional[int]:
+        if lookup_mode is not None:
+            logger.warning(
+                "MooncakeLookupClient ignores lookup_mode=%s.", lookup_mode
+            )
         # process token_ids to cacheengine keys
         keys = []
         ends = []

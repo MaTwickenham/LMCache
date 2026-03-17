@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 class LoadSpec:
     # Number of tokens cached in vLLM
     vllm_cached_tokens: int
-    # Number of tokens that are cached in LMCache
+    # Dense reusable window end carried from LMCache lookup.
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
@@ -278,6 +278,8 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
+    # Save only uses a prefix of token_ids/slot_mapping.
+    save_token_count: int = 0
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -363,6 +365,19 @@ class ReqMeta:
         )
 
         if skip_save and load_spec is None:
+            record_phase(
+                tracker.req_id,
+                "req_meta_s",
+                0.0,
+                request_kind=request_kind or "unknown",
+                emitted=False,
+                skip_save=skip_save,
+                is_last_prefill=is_last_prefill,
+                input_token_len=input_token_len,
+                prompt_len=tracker.prompt_len,
+                num_saved_tokens=tracker.num_saved_tokens,
+                has_load_spec=load_spec is not None,
+            )
             return None
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -381,26 +396,18 @@ class ReqMeta:
         # If we need to save, update the number of saved tokens
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
+        if is_fragment_prefill:
+            # Fragment-prefill is the offline materialization path for Blend.
+            # Sparse lookup returns a dense window end, which is not a safe
+            # prefix skip length for saving. Force full save so fragment KV is
+            # always materialized into LMCache.
+            skip_leading_tokens = 0
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
-
-        # Calculate the token ids and slot mappings for load and save
-        token_ids = input_token_ids[:num_tokens_to_save]
-
-        # If the request has multimodal hashes, apply them to the token ids
-        if tracker.mm_hashes:
-            # TODO: Optimize this
-            token_ids = torch.tensor(token_ids)
-            assert tracker.mm_positions is not None, (
-                "tracker got mm_hashes but no mm_positions"
-            )
-            apply_mm_hashes_to_token_ids(
-                token_ids, tracker.mm_hashes, tracker.mm_positions
-            )
-            token_ids = token_ids.tolist()
 
         num_blocks = len(tracker.allocated_block_ids)
 
         max_slot_tokens = num_blocks * block_size
+        token_ids = input_token_ids
         if len(token_ids) > max_slot_tokens:
             logger.warning(
                 "Clipping token_ids to slot mapping capacity for request %s. "
@@ -414,6 +421,20 @@ class ReqMeta:
             num_tokens_to_save = min(num_tokens_to_save, max_slot_tokens)
             if not skip_save:
                 tracker.num_saved_tokens = num_tokens_to_save
+
+        save_token_count = min(num_tokens_to_save, len(token_ids))
+
+        # If the request has multimodal hashes, apply them to the full load view.
+        if tracker.mm_hashes:
+            # TODO: Optimize this
+            token_ids = torch.tensor(token_ids)
+            assert tracker.mm_positions is not None, (
+                "tracker got mm_hashes but no mm_positions"
+            )
+            apply_mm_hashes_to_token_ids(
+                token_ids, tracker.mm_hashes, tracker.mm_positions
+            )
+            token_ids = token_ids.tolist()
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
@@ -435,10 +456,28 @@ class ReqMeta:
             )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
+        record_phase(
+            tracker.req_id,
+            "req_meta_s",
+            0.0,
+            request_kind=request_kind or "unknown",
+            emitted=True,
+            skip_save=skip_save,
+            is_last_prefill=is_last_prefill,
+            input_token_len=input_token_len,
+            prompt_len=tracker.prompt_len,
+            num_saved_tokens=tracker.num_saved_tokens,
+            save_token_count=save_token_count,
+            save_can_save=save_spec.can_save,
+            save_skip_leading_tokens=save_spec.skip_leading_tokens,
+            has_load_spec=load_spec is not None,
+            load_can_load=(load_spec.can_load if load_spec is not None else False),
+        )
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
+            save_token_count=save_token_count,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
             load_spec=load_spec,
@@ -541,14 +580,13 @@ class LMCacheConnectorV1Impl:
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.use_layerwise = config.use_layerwise
+        self.enable_blending = config.enable_blending
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
         else:
-            self.use_layerwise = config.use_layerwise
-            self.enable_blending = config.enable_blending
-
             if self.enable_blending:
                 assert self.lmcache_engine is not None
                 assert self.lmcache_engine.gpu_connector is not None, (
@@ -591,6 +629,58 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+
+    def _get_request_kind(self, request: ReqMeta) -> Optional[str]:
+        request_configs = request.request_configs or {}
+        request_kind = request_configs.get("lmcache.request_kind")
+        return str(request_kind) if request_kind is not None else None
+
+    def _get_sparse_safe_save_skip_tokens(
+        self,
+        request: ReqMeta,
+        skip_leading_tokens: int,
+        token_count: int,
+    ) -> int:
+        """Clip save-side prefix skipping to the true contiguous sparse prefix.
+
+        Sparse lookup returns a dense window end to drive online blending, but
+        save-side skip_leading_tokens is a prefix-only concept. Reusing the dense
+        window here would incorrectly skip saving fragment-prefill requests whose
+        reusable spans are non-contiguous.
+        """
+
+        if not self.enable_blending or skip_leading_tokens <= 0:
+            return skip_leading_tokens
+
+        request_kind = self._get_request_kind(request)
+        if request_kind != "fragment_prefill":
+            return skip_leading_tokens
+
+        plan = self.lmcache_engine.lookup_plans.get(request.req_id)
+        if plan is None:
+            return skip_leading_tokens
+
+        prefix_end = 0
+        for span in plan.hit_spans:
+            if span.start > prefix_end:
+                break
+            prefix_end = max(prefix_end, span.end)
+
+        adjusted_skip = min(skip_leading_tokens, prefix_end, token_count)
+        if adjusted_skip != skip_leading_tokens:
+            record_phase(
+                request.req_id,
+                "save_skip_adjust_s",
+                0.0,
+                request_kind=request_kind,
+                old_skip=skip_leading_tokens,
+                adjusted_skip=adjusted_skip,
+                token_count=token_count,
+                plan_prefix_end=prefix_end,
+                plan_window_end=plan.window_end,
+                plan_reused_tokens=plan.reused_token_count,
+            )
+        return adjusted_skip
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -832,7 +922,31 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            lmcache_cached_tokens = min(
+                request.load_spec.lmcache_cached_tokens,
+                len(tokens),
+                len(slot_mapping),
+            )
+            if lmcache_cached_tokens < request.load_spec.lmcache_cached_tokens:
+                logger.warning(
+                    "Clipping LMCache load window for request %s from %d to %d tokens.",
+                    request.req_id,
+                    request.load_spec.lmcache_cached_tokens,
+                    lmcache_cached_tokens,
+                )
+
+            record_phase(
+                request.req_id,
+                "start_load_window_s",
+                0.0,
+                load_spec_lmcache_cached_tokens=request.load_spec.lmcache_cached_tokens,
+                clipped_lmcache_cached_tokens=lmcache_cached_tokens,
+                masked_token_count=masked_token_count,
+                request_num_tokens=len(tokens),
+                token_ids_len=len(tokens),
+                slot_mapping_len=len(slot_mapping),
+            )
+
             load_tokens = tokens[:lmcache_cached_tokens]
             load_slot_mapping = slot_mapping[:lmcache_cached_tokens]
             load_token_mask = token_mask[:lmcache_cached_tokens]
@@ -1060,10 +1174,10 @@ class LMCacheConnectorV1Impl:
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
-                token_ids = request.token_ids
+                token_ids = request.token_ids[: request.save_token_count]
                 assert isinstance(token_ids, list)
 
-                slot_mapping = request.slot_mapping
+                slot_mapping = request.slot_mapping[: request.save_token_count]
                 assert isinstance(slot_mapping, torch.Tensor)
                 if len(slot_mapping) != len(token_ids):
                     clipped_len = min(len(slot_mapping), len(token_ids))
@@ -1090,6 +1204,11 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = min(
                         save_spec.skip_leading_tokens, len(token_ids)
                     )
+                    skip_leading_tokens = self._get_sparse_safe_save_skip_tokens(
+                        request,
+                        skip_leading_tokens,
+                        len(token_ids),
+                    )
 
                     if skip_leading_tokens == len(token_ids):
                         continue  # skip this request
@@ -1105,7 +1224,11 @@ class LMCacheConnectorV1Impl:
                     # online blended prompt after partially reusing cached KV can
                     # hit shape-mismatch bugs in the current layerwise store path
                     # and does not materially help the fragment-pool benchmark.
-                    if self.config.enable_blending and skip_leading_tokens > 0:
+                    if (
+                        self.config.enable_blending
+                        and self._get_request_kind(request) != "fragment_prefill"
+                        and skip_leading_tokens > 0
+                    ):
                         logger.debug(
                             "Skipping save for blended request %s after %d "
                             "reused leading tokens.",
@@ -1116,6 +1239,15 @@ class LMCacheConnectorV1Impl:
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
+                record_phase(
+                    request.req_id,
+                    "save_request_s",
+                    0.0,
+                    request_kind=self._get_request_kind(request) or "unknown",
+                    save_token_count=len(token_ids),
+                    skip_leading_tokens=skip_leading_tokens,
+                    tokens_to_store=int(store_mask.sum().item()),
+                )
 
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
@@ -1180,9 +1312,9 @@ class LMCacheConnectorV1Impl:
             ) and self.kv_role != "kv_producer":
                 continue
 
-            token_ids = request.token_ids
+            token_ids = request.token_ids[: request.save_token_count]
 
-            slot_mapping = request.slot_mapping
+            slot_mapping = request.slot_mapping[: request.save_token_count]
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
@@ -1195,6 +1327,11 @@ class LMCacheConnectorV1Impl:
                 skip_leading_tokens = min(
                     skip_leading_tokens, request.disagg_spec.num_transferred_tokens
                 )
+            skip_leading_tokens = self._get_sparse_safe_save_skip_tokens(
+                request,
+                skip_leading_tokens,
+                len(token_ids),
+            )
 
             if skip_leading_tokens == len(token_ids):
                 continue  # skip this request
@@ -1338,19 +1475,58 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            lookup_start = time.perf_counter()
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
-            )
-            record_phase(
-                req_id,
-                "lookup_total_s",
-                time.perf_counter() - lookup_start,
-                prompt_tokens=len(token_ids),
-                request_configs=bool(request_configs),
-            )
+            request_kind = None
+            if request_configs is not None:
+                request_kind = request_configs.get("lmcache.request_kind")
+
+            # Offline fragment-prefill is the cache materialization stage for
+            # Blend. Reusing LMCache during this stage corrupts the benchmark
+            # semantics: sparse lookup returns a dense window end and can make
+            # the scheduler treat the fragment as already materialized.
+            if request_kind == "fragment_prefill":
+                num_external_hit_tokens = 0
+                record_phase(
+                    req_id,
+                    "lookup_total_s",
+                    0.0,
+                    prompt_tokens=len(token_ids),
+                    request_configs=bool(request_configs),
+                    lookup_mode="disabled_fragment_prefill",
+                    num_external_hit_tokens=0,
+                    num_computed_tokens=num_computed_tokens,
+                    request_num_tokens=request.num_tokens,
+                )
+            else:
+                lookup_mode = None
+                if (
+                    self.enable_blending
+                    and self.use_layerwise
+                    and num_computed_tokens == 0
+                ):
+                    lookup_mode = "sparse_blend_window"
+
+                lookup_start = time.perf_counter()
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                    lookup_mode=lookup_mode,
+                )
+                record_phase(
+                    req_id,
+                    "lookup_total_s",
+                    time.perf_counter() - lookup_start,
+                    prompt_tokens=len(token_ids),
+                    request_configs=bool(request_configs),
+                    lookup_mode=lookup_mode or "default",
+                    num_external_hit_tokens=(
+                        -1
+                        if num_external_hit_tokens is None
+                        else num_external_hit_tokens
+                    ),
+                    num_computed_tokens=num_computed_tokens,
+                    request_num_tokens=request.num_tokens,
+                )
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1405,6 +1581,16 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+        )
+        record_phase(
+            req_id,
+            "load_spec_created_s",
+            0.0,
+            lmcache_cached_tokens=num_external_hit_tokens,
+            vllm_cached_tokens=num_computed_tokens,
+            need_to_allocate=max(need_to_allocate, 0),
+            request_num_tokens=request.num_tokens,
+            below_min_retrieve=below_min_retrieve,
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
@@ -1488,6 +1674,15 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        record_phase(
+            request.request_id,
+            "load_spec_ready_s",
+            0.0,
+            num_external_tokens=num_external_tokens,
+            lmcache_cached_tokens=self.load_specs[request.request_id].lmcache_cached_tokens,
+            vllm_cached_tokens=self.load_specs[request.request_id].vllm_cached_tokens,
+            request_num_tokens=request.num_tokens,
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
