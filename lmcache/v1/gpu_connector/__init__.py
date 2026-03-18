@@ -86,11 +86,31 @@ def CreateGPUConnector(
                     enable_internal_timing = bool(
                         config.get_extra_config_value("blend_internal_timing", False)
                     )
+                    pipeline_buffer_count = int(
+                        config.get_extra_config_value("blend_pipeline_buffers", 3)
+                    )
+                    buffer_bucket_granularity_tokens = int(
+                        config.get_extra_config_value(
+                            "blend_buffer_bucket_tokens",
+                            256,
+                        )
+                    )
+                    max_cached_buffer_packs = int(
+                        config.get_extra_config_value(
+                            "blend_max_cached_buffer_packs",
+                            4,
+                        )
+                    )
                     return VLLMFastBlendLayerwiseGPUConnector.from_metadata(
                         metadata,
                         use_gpu,
                         device,
                         enable_internal_timing=enable_internal_timing,
+                        pipeline_buffer_count=pipeline_buffer_count,
+                        buffer_bucket_granularity_tokens=(
+                            buffer_bucket_granularity_tokens
+                        ),
+                        max_cached_buffer_packs=max_cached_buffer_packs,
                     )
                 raise ValueError(
                     f"Unknown blend_connector_impl={blend_connector_impl!r}. "

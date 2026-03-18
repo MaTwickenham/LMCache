@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 import abc
@@ -72,6 +73,19 @@ class BlendTransferSubset:
     new_positions_cat: torch.Tensor
     old_positions_cat: Optional[torch.Tensor] = None
     old_positions_chunks: Optional[list[torch.Tensor]] = None
+
+
+@dataclass
+class BlendLayerBufferPack:
+    bucket_tokens: int
+    buffer_shape: torch.Size
+    backing_objs: list[MemoryObj]
+
+
+@dataclass
+class BlendLayerBufferLease:
+    pack: BlendLayerBufferPack
+    buffer_objs: list[MemoryObj]
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -1095,10 +1109,22 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         self.transfer_stream = torch.cuda.Stream()
         self.layer_ready_events: dict[int, torch.cuda.Event] = {}
         self._buffer_cache_lock = threading.Lock()
-        self._cached_buffer_shape: Optional[torch.Size] = None
-        self._cached_buffer_objs: Optional[list[MemoryObj]] = None
-        self._cached_buffer_in_use = False
         self.enable_internal_timing = bool(kwargs.get("enable_internal_timing", False))
+        self.pipeline_buffer_count = max(
+            int(kwargs.get("pipeline_buffer_count", 3)),
+            2,
+        )
+        self.buffer_bucket_granularity_tokens = max(
+            int(kwargs.get("buffer_bucket_granularity_tokens", 256)),
+            1,
+        )
+        self.max_cached_buffer_packs = max(
+            int(kwargs.get("max_cached_buffer_packs", 4)),
+            1,
+        )
+        self._cached_buffer_packs: OrderedDict[int, BlendLayerBufferPack] = (
+            OrderedDict()
+        )
 
     @staticmethod
     def _sum_cuda_event_durations(
@@ -1156,39 +1182,104 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
             parent_allocator=None,
         )
 
-    def _acquire_layer_buffers(self, buffer_shape: torch.Size) -> list[MemoryObj]:
-        with self._buffer_cache_lock:
-            if (
-                not self._cached_buffer_in_use
-                and self._cached_buffer_objs is not None
-                and self._cached_buffer_shape == buffer_shape
-            ):
-                self._cached_buffer_in_use = True
-                return self._cached_buffer_objs
+    def _allocate_standalone_layer_buffer(self, buffer_shape: torch.Size) -> MemoryObj:
+        raw_size = buffer_shape.numel() * self.element_size
+        raw_data = torch.empty(raw_size, dtype=torch.uint8, device=self.device)
+        return TensorMemoryObj(
+            raw_data=raw_data,
+            metadata=MemoryObjMetadata(
+                shape=buffer_shape,
+                dtype=self.dtype,
+                address=0,
+                phy_size=raw_data.numel(),
+                ref_count=1,
+                pin_count=0,
+                fmt=MemoryFormat.KV_2TD,
+                shapes=[buffer_shape],
+                dtypes=[self.dtype],
+            ),
+            parent_allocator=None,
+        )
 
-        return [
-            self._allocate_layer_buffer(buffer_shape),
-            self._allocate_layer_buffer(buffer_shape),
-        ]
+    def _get_buffer_bucket_tokens(self, num_tokens: int) -> int:
+        granularity = self.buffer_bucket_granularity_tokens
+        return ((num_tokens + granularity - 1) // granularity) * granularity
+
+    def _make_layer_buffer_view(
+        self,
+        backing_obj: MemoryObj,
+        buffer_shape: torch.Size,
+    ) -> MemoryObj:
+        raw_tensor = backing_obj.raw_tensor
+        assert raw_tensor is not None
+        raw_size = buffer_shape.numel() * self.element_size
+        return TensorMemoryObj(
+            raw_data=raw_tensor[:raw_size],
+            metadata=MemoryObjMetadata(
+                shape=buffer_shape,
+                dtype=self.dtype,
+                address=backing_obj.metadata.address,
+                phy_size=backing_obj.metadata.phy_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=MemoryFormat.KV_2TD,
+                shapes=[buffer_shape],
+                dtypes=[self.dtype],
+            ),
+            parent_allocator=None,
+        )
+
+    def _allocate_layer_buffer_pack(self, buffer_shape: torch.Size) -> BlendLayerBufferPack:
+        bucket_tokens = int(buffer_shape[1])
+        return BlendLayerBufferPack(
+            bucket_tokens=bucket_tokens,
+            buffer_shape=buffer_shape,
+            backing_objs=[
+                self._allocate_standalone_layer_buffer(buffer_shape)
+                for _ in range(self.pipeline_buffer_count)
+            ],
+        )
+
+    def _free_layer_buffer_pack(self, pack: BlendLayerBufferPack) -> None:
+        for backing_obj in pack.backing_objs:
+            backing_obj.ref_count_down()
+
+    def _acquire_layer_buffers(self, buffer_shape: torch.Size) -> BlendLayerBufferLease:
+        requested_tokens = int(buffer_shape[1])
+        bucket_tokens = self._get_buffer_bucket_tokens(requested_tokens)
+        bucket_shape = self.get_shape(bucket_tokens)
+
+        with self._buffer_cache_lock:
+            pack = self._cached_buffer_packs.pop(bucket_tokens, None)
+
+        if pack is None:
+            pack = self._allocate_layer_buffer_pack(bucket_shape)
+
+        return BlendLayerBufferLease(
+            pack=pack,
+            buffer_objs=[
+                self._make_layer_buffer_view(backing_obj, buffer_shape)
+                for backing_obj in pack.backing_objs
+            ],
+        )
 
     def _release_layer_buffers(
         self,
-        buffer_shape: torch.Size,
-        buffer_objs: list[MemoryObj],
+        lease: BlendLayerBufferLease,
     ) -> None:
+        evicted_packs: list[BlendLayerBufferPack] = []
         with self._buffer_cache_lock:
-            if buffer_objs is self._cached_buffer_objs:
-                self._cached_buffer_in_use = False
-                return
+            if lease.pack.bucket_tokens in self._cached_buffer_packs:
+                evicted_packs.append(lease.pack)
+            else:
+                self._cached_buffer_packs[lease.pack.bucket_tokens] = lease.pack
+                self._cached_buffer_packs.move_to_end(lease.pack.bucket_tokens)
+                while len(self._cached_buffer_packs) > self.max_cached_buffer_packs:
+                    _, evicted_pack = self._cached_buffer_packs.popitem(last=False)
+                    evicted_packs.append(evicted_pack)
 
-            if self._cached_buffer_objs is None:
-                self._cached_buffer_shape = buffer_shape
-                self._cached_buffer_objs = buffer_objs
-                self._cached_buffer_in_use = False
-                return
-
-        for buffer_obj in buffer_objs:
-            buffer_obj.ref_count_down()
+        for evicted_pack in evicted_packs:
+            self._free_layer_buffer_pack(evicted_pack)
 
     def _build_transfer_plan(
         self,
@@ -1565,7 +1656,8 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
             dense_window_end=kwargs.get("dense_window_end"),
         )
 
-        buffer_objs = self._acquire_layer_buffers(transfer_plan.buffer_shape)
+        buffer_lease = self._acquire_layer_buffers(transfer_plan.buffer_shape)
+        buffer_objs = buffer_lease.buffer_objs
 
         copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         rope_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
@@ -1575,6 +1667,7 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         self.layer_ready_events.clear()
         layer_to_buffer_idx: dict[int, int] = {}
         load_buffer_idx = 0
+        num_pipeline_buffers = len(buffer_objs)
         buffer_release_events: dict[int, torch.cuda.Event] = {}
         last_transfer_done_event: Optional[torch.cuda.Event] = None
 
@@ -1587,10 +1680,6 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         cpu_subset = self._build_transfer_subset(transfer_plan, cpu_span_indices)
 
         for layer_id in range(self.num_layers):
-            release_event = buffer_release_events.pop(load_buffer_idx, None)
-            if release_event is not None:
-                self.load_stream.wait_event(release_event)
-
             if layer_id > 0:
                 prev_layer_id = layer_id - 1
                 prev_buffer_idx = layer_to_buffer_idx.pop(prev_layer_id)
@@ -1606,6 +1695,10 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
                 self.buffer_mapping.pop(prev_layer_id, None)
                 buffer_release_events[prev_buffer_idx] = last_transfer_done_event
 
+            release_event = buffer_release_events.pop(load_buffer_idx, None)
+            if release_event is not None:
+                self.load_stream.wait_event(release_event)
+
             current_buffer_obj = buffer_objs[load_buffer_idx]
             self._schedule_fragment_copy_and_rope(
                 layer_id,
@@ -1620,7 +1713,7 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
 
             self.buffer_mapping[layer_id] = current_buffer_obj
             layer_to_buffer_idx[layer_id] = load_buffer_idx
-            load_buffer_idx = 1 - load_buffer_idx
+            load_buffer_idx = (load_buffer_idx + 1) % num_pipeline_buffers
 
             if layer_id + 1 < self.num_layers:
                 memory_objs_layer = yield
@@ -1644,7 +1737,7 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         if last_transfer_done_event is not None:
             last_transfer_done_event.synchronize()
 
-        self._release_layer_buffers(transfer_plan.buffer_shape, buffer_objs)
+        self._release_layer_buffers(buffer_lease)
 
         assert len(self.buffer_mapping) == 0, (
             "There are still layers in the buffer mapping after "

@@ -266,6 +266,24 @@ def parse_args() -> argparse.Namespace:
             "for lower serving overhead."
         ),
     )
+    parser.add_argument(
+        "--blend-pipeline-buffers",
+        type=int,
+        default=3,
+        help="Number of in-flight full-window layer buffers used by the fast blend connector.",
+    )
+    parser.add_argument(
+        "--blend-buffer-bucket-tokens",
+        type=int,
+        default=256,
+        help="Token granularity used to bucket reusable fast-connector layer buffers.",
+    )
+    parser.add_argument(
+        "--blend-max-cached-buffer-packs",
+        type=int,
+        default=4,
+        help="Maximum number of cached fast-connector buffer buckets kept warm.",
+    )
     parser.add_argument("--port", type=int, default=8015)
     parser.add_argument("--startup-timeout-s", type=float, default=240.0)
     parser.add_argument(
@@ -1049,6 +1067,13 @@ def build_blend_gpu_lmcache_env(
     if args.blend_connector_impl:
         extra_config["blend_connector_impl"] = str(args.blend_connector_impl)
     extra_config["blend_internal_timing"] = bool(args.blend_internal_timing)
+    extra_config["blend_pipeline_buffers"] = int(args.blend_pipeline_buffers)
+    extra_config["blend_buffer_bucket_tokens"] = int(
+        args.blend_buffer_bucket_tokens
+    )
+    extra_config["blend_max_cached_buffer_packs"] = int(
+        args.blend_max_cached_buffer_packs
+    )
     if extra_config:
         env["LMCACHE_EXTRA_CONFIG"] = json.dumps(extra_config)
     return env
