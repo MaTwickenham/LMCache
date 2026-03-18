@@ -83,8 +83,14 @@ def CreateGPUConnector(
                         metadata, use_gpu, device
                     )
                 if blend_connector_impl == "fast":
+                    enable_internal_timing = bool(
+                        config.get_extra_config_value("blend_internal_timing", False)
+                    )
                     return VLLMFastBlendLayerwiseGPUConnector.from_metadata(
-                        metadata, use_gpu, device
+                        metadata,
+                        use_gpu,
+                        device,
+                        enable_internal_timing=enable_internal_timing,
                     )
                 raise ValueError(
                     f"Unknown blend_connector_impl={blend_connector_impl!r}. "

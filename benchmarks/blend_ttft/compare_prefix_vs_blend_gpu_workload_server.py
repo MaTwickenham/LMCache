@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Benchmark vLLM prefix caching vs LMCache CacheBlend on real workloads.
 
-This benchmark intentionally compares only GPU-resident reusable cache budgets:
+This benchmark compares native vLLM prefix caching against LMCache CacheBlend
+under explicit local KV-cache budgets. The Blend path can now use:
 
-1. Native vLLM prefix caching with an explicit `kv_cache_memory_bytes` cap.
-2. LMCache CacheBlend with `LocalGPUBackend` enabled and `LocalCPUBackend`
-   disabled.
+1. GPU-only fragment storage.
+2. CPU-only fragment storage.
+3. Tiered GPU+CPU fragment storage, with request-level prefill placement.
 
 The script supports three processed workload formats under
 `example/benchmark_e2e/data/processed`:
@@ -57,6 +58,14 @@ from compare_prefix_vs_blend_memoryos_server import (
     summarize_online_phase_breakdown,
     summarize_prefill,
 )
+from utility_guided_prefill import (
+    BYTES_PER_TOKEN,
+    UtilityPlannerConfig,
+    attach_prior_use_count,
+    enrich_id_backed_hints,
+    enrich_memoryos_hints,
+    plan_prefill_placements,
+)
 
 
 WORKLOAD_KIND_CHOICES = ("memoryos", "amem", "memos")
@@ -85,10 +94,13 @@ class BenchmarkResult:
     datasets: list[str]
     prefix_kv_cache_bytes: int
     blend_vllm_kv_cache_bytes: int
+    blend_local_cpu_size_gb: float
     blend_local_gpu_size_gb: float
     chunk_sizes: list[int]
     prefill_order_policy: str
+    prefill_placement_policy: str
     workload: WorkloadStats
+    prefill_plan_summary: dict[str, int]
     native_prefix: LatencySummary
     blend_gpu_results: list[BlendChunkResult]
 
@@ -202,6 +214,40 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="LMCache LocalGPUBackend budget in GiB.",
     )
+    parser.add_argument(
+        "--max-local-cpu-size",
+        type=float,
+        default=0.0,
+        help="LMCache LocalCPUBackend budget in GiB.",
+    )
+    parser.add_argument(
+        "--prefill-placement-policy",
+        type=str,
+        choices=["all_gpu", "all_cpu", "utility"],
+        default="all_gpu",
+        help=(
+            "Where offline fragment-prefill requests should store KV. "
+            "'utility' uses the old utility model to choose GPU / CPU / drop."
+        ),
+    )
+    parser.add_argument(
+        "--utility-cost-model",
+        type=str,
+        default='{"recompute_ms_per_token":0.02,"transfer_gib_per_s":12.0}',
+        help="Inline JSON cost model used by the migrated utility planner.",
+    )
+    parser.add_argument(
+        "--utility-tail-lambda",
+        type=float,
+        default=0.0,
+        help="Tail-sensitivity knob passed to the migrated utility planner.",
+    )
+    parser.add_argument(
+        "--utility-gpu-penalty-ms",
+        type=float,
+        default=0.0,
+        help="Penalty for choosing GPU admission in the migrated utility planner.",
+    )
     parser.add_argument("--blend-check-layers", type=str, default="1")
     parser.add_argument("--blend-recompute-ratios", type=str, default="0.15")
     parser.add_argument(
@@ -209,6 +255,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="fast",
         help="LMCache blend connector implementation name.",
+    )
+    parser.add_argument(
+        "--blend-internal-timing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable detailed internal CUDA-event timing inside the blend "
+            "connector. Keep this on for profiling benchmarks; turn it off "
+            "for lower serving overhead."
+        ),
     )
     parser.add_argument("--port", type=int, default=8015)
     parser.add_argument("--startup-timeout-s", type=float, default=240.0)
@@ -263,12 +319,19 @@ def main() -> None:
         max_model_len=int(args.max_model_len),
         warmup_query_text=str(args.warmup_query_text),
         prefill_query_text=str(args.prefill_query_text),
+        prefill_placement_policy=str(args.prefill_placement_policy),
+        utility_cost_model=str(args.utility_cost_model),
+        utility_tail_lambda=float(args.utility_tail_lambda),
+        utility_gpu_penalty_ms=float(args.utility_gpu_penalty_ms),
+        max_local_gpu_size=float(args.max_local_gpu_size),
+        max_local_cpu_size=float(args.max_local_cpu_size),
     )
 
     print_workload_stats(
         workload_kind=str(args.workload_kind),
         stats=workload["stats"],
         prefill_order_policy=str(args.prefill_order_policy),
+        prefill_plan_summary=workload["prefill_plan_summary"],
     )
     if args.dry_run:
         return
@@ -303,10 +366,13 @@ def main() -> None:
         datasets=datasets,
         prefix_kv_cache_bytes=prefix_kv_cache_bytes,
         blend_vllm_kv_cache_bytes=blend_vllm_kv_cache_bytes,
+        blend_local_cpu_size_gb=float(args.max_local_cpu_size),
         blend_local_gpu_size_gb=float(args.max_local_gpu_size),
         chunk_sizes=chunk_sizes,
         prefill_order_policy=str(args.prefill_order_policy),
+        prefill_placement_policy=str(args.prefill_placement_policy),
         workload=workload["stats"],
+        prefill_plan_summary=workload["prefill_plan_summary"],
         native_prefix=native_prefix,
         blend_gpu_results=blend_gpu_results,
     )
@@ -352,6 +418,10 @@ def gib_to_bytes(size_gib: float) -> int:
     return int(float(size_gib) * 1024**3)
 
 
+def gib_to_token_budget(size_gib: float) -> int:
+    return int((float(size_gib) * 1024**3) / BYTES_PER_TOKEN)
+
+
 def build_workload(
     *,
     tokenizer: PreTrainedTokenizerBase,
@@ -368,12 +438,19 @@ def build_workload(
     max_model_len: int,
     warmup_query_text: str,
     prefill_query_text: str,
+    prefill_placement_policy: str,
+    utility_cost_model: str,
+    utility_tail_lambda: float,
+    utility_gpu_penalty_ms: float,
+    max_local_gpu_size: float,
+    max_local_cpu_size: float,
 ) -> dict[str, Any]:
     if not data_root.exists():
         raise FileNotFoundError(f"Processed data root does not exist: {data_root}")
 
     unique_chunks: dict[str, dict[str, Any]] = {}
     query_records: list[QueryRecord] = []
+    query_chunk_ids: list[list[str]] = []
     prefill_first_seen: list[str] = []
     prefill_seen: set[str] = set()
 
@@ -437,6 +514,7 @@ def build_workload(
                 policy=fragment_order_policy,
                 shuffle_seed=shuffle_seed,
             )
+            query_chunk_ids.append(list(ordered_chunk_ids))
 
             for chunk_id in ordered_chunk_ids:
                 if chunk_id in prefill_seen:
@@ -491,11 +569,35 @@ def build_workload(
                 )
             )
 
+    attach_prior_use_count(
+        unique_chunks=unique_chunks,
+        query_chunk_ids=query_chunk_ids,
+    )
+    if workload_kind == "memoryos":
+        enrich_memoryos_hints(unique_chunks)
+    else:
+        enrich_id_backed_hints(
+            workload_kind=workload_kind,
+            unique_chunks=unique_chunks,
+            data_root=data_root,
+            datasets=datasets,
+        )
+
     prefill_order = apply_prefill_order_policy(
         prefill_first_seen=prefill_first_seen,
         policy=prefill_order_policy,
         shuffle_seed=shuffle_seed,
         workload_kind=workload_kind,
+    )
+    prefill_plan = build_prefill_plan(
+        unique_chunks=unique_chunks,
+        prefill_order=prefill_order,
+        prefill_placement_policy=prefill_placement_policy,
+        utility_cost_model=utility_cost_model,
+        utility_tail_lambda=utility_tail_lambda,
+        utility_gpu_penalty_ms=utility_gpu_penalty_ms,
+        max_local_gpu_size=max_local_gpu_size,
+        max_local_cpu_size=max_local_cpu_size,
     )
     prefill_records = build_prefill_records(
         tokenizer=tokenizer,
@@ -506,6 +608,7 @@ def build_workload(
         prefill_query_text=prefill_query_text,
         prompt_layout=prompt_layout,
         max_model_len=max_model_len,
+        prefill_plan=prefill_plan,
     )
     stats = build_workload_stats(
         datasets=datasets,
@@ -522,7 +625,102 @@ def build_workload(
         "query_records": query_records,
         "prefill_records": prefill_records,
         "warmup_prompt_ids": warmup_prompt_ids,
+        "prefill_plan": prefill_plan,
+        "prefill_plan_summary": summarize_prefill_plan(
+            unique_chunks=unique_chunks,
+            prefill_plan=prefill_plan,
+        ),
     }
+
+
+def build_prefill_plan(
+    *,
+    unique_chunks: dict[str, dict[str, Any]],
+    prefill_order: list[str],
+    prefill_placement_policy: str,
+    utility_cost_model: str,
+    utility_tail_lambda: float,
+    utility_gpu_penalty_ms: float,
+    max_local_gpu_size: float,
+    max_local_cpu_size: float,
+) -> dict[str, dict[str, Any]]:
+    plan: dict[str, dict[str, Any]] = {}
+    has_gpu = float(max_local_gpu_size) > 0.0
+    has_cpu = float(max_local_cpu_size) > 0.0
+    if not has_gpu and not has_cpu:
+        raise ValueError("At least one of max_local_gpu_size or max_local_cpu_size must be > 0.")
+
+    if prefill_placement_policy == "utility":
+        cfg = UtilityPlannerConfig.from_args(
+            utility_cost_model=utility_cost_model,
+            tail_lambda=utility_tail_lambda,
+            gpu_then_cpu_penalty_ms=utility_gpu_penalty_ms,
+        )
+        placements = plan_prefill_placements(
+            unique_chunks=unique_chunks,
+            prefill_order=prefill_order,
+            gpu_budget_tokens=gib_to_token_budget(max_local_gpu_size),
+            cpu_budget_tokens=gib_to_token_budget(max_local_cpu_size),
+            cfg=cfg,
+            writeback_async=True,
+        )
+        for item in placements:
+            plan[item.chunk_id] = {
+                "enabled": item.target_location is not None,
+                "target_location": item.target_location,
+                "action": item.action,
+                "utility": item.utility,
+            }
+        return plan
+
+    if prefill_placement_policy == "all_gpu":
+        if not has_gpu:
+            raise ValueError("prefill_placement_policy=all_gpu requires max_local_gpu_size > 0.")
+        target_location = "LocalGPUBackend"
+    elif prefill_placement_policy == "all_cpu":
+        if not has_cpu:
+            raise ValueError("prefill_placement_policy=all_cpu requires max_local_cpu_size > 0.")
+        target_location = "LocalCPUBackend"
+    else:
+        raise ValueError(f"Unsupported prefill_placement_policy={prefill_placement_policy!r}")
+
+    for chunk_id in prefill_order:
+        plan[chunk_id] = {
+            "enabled": True,
+            "target_location": target_location,
+            "action": prefill_placement_policy,
+            "utility": None,
+        }
+    return plan
+
+
+def summarize_prefill_plan(
+    *,
+    unique_chunks: dict[str, dict[str, Any]],
+    prefill_plan: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    summary = {
+        "gpu_fragments": 0,
+        "cpu_fragments": 0,
+        "dropped_fragments": 0,
+        "gpu_tokens": 0,
+        "cpu_tokens": 0,
+        "dropped_tokens": 0,
+    }
+    for chunk_id, meta in prefill_plan.items():
+        chunk = unique_chunks[chunk_id]
+        tokens = int(chunk.get("tokens", 0) or 0)
+        target_location = meta.get("target_location")
+        if target_location == "LocalGPUBackend":
+            summary["gpu_fragments"] += 1
+            summary["gpu_tokens"] += tokens
+        elif target_location == "LocalCPUBackend":
+            summary["cpu_fragments"] += 1
+            summary["cpu_tokens"] += tokens
+        else:
+            summary["dropped_fragments"] += 1
+            summary["dropped_tokens"] += tokens
+    return summary
 
 
 def load_trace(
@@ -842,14 +1040,15 @@ def build_blend_gpu_lmcache_env(
         "LMCACHE_BLEND_CHECK_LAYERS": str(args.blend_check_layers),
         "LMCACHE_BLEND_RECOMPUTE_RATIOS": str(args.blend_recompute_ratios),
         "LMCACHE_PHASE_TIMING_PATH": str(phase_file),
-        "LMCACHE_LOCAL_CPU": "False",
-        "LMCACHE_MAX_LOCAL_CPU_SIZE": "0",
-        "LMCACHE_LOCAL_GPU": "True",
+        "LMCACHE_LOCAL_CPU": "True" if float(args.max_local_cpu_size) > 0.0 else "False",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": str(args.max_local_cpu_size),
+        "LMCACHE_LOCAL_GPU": "True" if float(args.max_local_gpu_size) > 0.0 else "False",
         "LMCACHE_MAX_LOCAL_GPU_SIZE": str(args.max_local_gpu_size),
     }
     extra_config = {}
     if args.blend_connector_impl:
         extra_config["blend_connector_impl"] = str(args.blend_connector_impl)
+    extra_config["blend_internal_timing"] = bool(args.blend_internal_timing)
     if extra_config:
         env["LMCACHE_EXTRA_CONFIG"] = json.dumps(extra_config)
     return env
@@ -884,6 +1083,12 @@ def run_blend_gpu_workload(
         chunk_size=chunk_size,
         phase_file=phase_file,
     )
+    if float(args.max_local_gpu_size) > 0.0 and float(args.max_local_cpu_size) > 0.0:
+        backend_name = "tiered"
+    elif float(args.max_local_gpu_size) > 0.0:
+        backend_name = "gpu"
+    else:
+        backend_name = "cpu"
 
     with launch_server(
         model=args.model,
@@ -921,9 +1126,7 @@ def run_blend_gpu_workload(
                         model=args.model,
                         prompt_ids=record.prompt_ids,
                         max_tokens=args.max_tokens,
-                        kv_transfer_params={
-                            "lmcache.request_kind": "fragment_prefill",
-                        },
+                        kv_transfer_params=_build_prefill_transfer_params(record),
                     )
                 )
             except Exception as exc:
@@ -980,7 +1183,7 @@ def run_blend_gpu_workload(
     if query_measurements:
         first_query_ttft_s = query_measurements[0].ttft_s or 0.0
     return BlendChunkResult(
-        backend="gpu",
+        backend=backend_name,
         chunk_size=chunk_size,
         prefill=prefill_summary,
         online=online_summary,
@@ -991,11 +1194,21 @@ def run_blend_gpu_workload(
     )
 
 
+def _build_prefill_transfer_params(record: PrefillRecord) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "lmcache.request_kind": "fragment_prefill",
+    }
+    if record.store_location is not None:
+        params["lmcache.store_location"] = record.store_location
+    return params
+
+
 def print_workload_stats(
     *,
     workload_kind: str,
     stats: WorkloadStats,
     prefill_order_policy: str,
+    prefill_plan_summary: dict[str, int] | None = None,
 ) -> None:
     print("=" * 80)
     print("Workload")
@@ -1028,6 +1241,13 @@ def print_workload_stats(
     print(f"prompt_layout: {stats.prompt_layout}")
     print(f"fragment_order_policy: {stats.fragment_order_policy}")
     print(f"prefill_order_policy: {prefill_order_policy}")
+    if prefill_plan_summary is not None:
+        print(
+            "prefill_plan: "
+            f"gpu={prefill_plan_summary['gpu_fragments']} fragments / {prefill_plan_summary['gpu_tokens']} tokens, "
+            f"cpu={prefill_plan_summary['cpu_fragments']} fragments / {prefill_plan_summary['cpu_tokens']} tokens, "
+            f"drop={prefill_plan_summary['dropped_fragments']} fragments / {prefill_plan_summary['dropped_tokens']} tokens"
+        )
     print(f"shuffle_seed: {stats.shuffle_seed}")
     print(f"system_prompt_tokens: {stats.system_prompt_tokens}")
     print(f"blend_special_str: {stats.blend_special_str!r}")
@@ -1045,15 +1265,24 @@ def print_result(result: BenchmarkResult) -> None:
     print(f"datasets: {', '.join(result.datasets)}")
     print(f"prefix_kv_cache_bytes: {result.prefix_kv_cache_bytes}")
     print(f"blend_vllm_kv_cache_bytes: {result.blend_vllm_kv_cache_bytes}")
+    print(f"blend_local_cpu_size_gb: {result.blend_local_cpu_size_gb:.2f}")
     print(f"blend_local_gpu_size_gb: {result.blend_local_gpu_size_gb:.2f}")
     print(f"chunk_sizes: {', '.join(str(size) for size in result.chunk_sizes)}")
+    print(f"prefill_order_policy: {result.prefill_order_policy}")
+    print(f"prefill_placement_policy: {result.prefill_placement_policy}")
+    print(
+        "prefill_plan: "
+        f"gpu={result.prefill_plan_summary['gpu_fragments']} fragments / {result.prefill_plan_summary['gpu_tokens']} tokens, "
+        f"cpu={result.prefill_plan_summary['cpu_fragments']} fragments / {result.prefill_plan_summary['cpu_tokens']} tokens, "
+        f"drop={result.prefill_plan_summary['dropped_fragments']} fragments / {result.prefill_plan_summary['dropped_tokens']} tokens"
+    )
     print()
     print("[native vLLM prefix caching]")
     print_mode_summary("online query", result.native_prefix, print_header=False)
 
     for item in result.blend_gpu_results:
         print()
-        print(f"[LMCache CacheBlend GPU chunk={item.chunk_size}]")
+        print(f"[LMCache CacheBlend {item.backend} chunk={item.chunk_size}]")
         print(
             "prefill: "
             f"requests={item.prefill.request_count}, "

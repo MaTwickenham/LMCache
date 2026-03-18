@@ -468,6 +468,11 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        store_location = None
+        if isinstance(request_configs, dict):
+            requested_location = request_configs.get("lmcache.store_location")
+            if requested_location is not None:
+                store_location = str(requested_location)
 
         with store_stats.profile_process_tokens():
             prev_key = 0
@@ -551,7 +556,10 @@ class LMCacheEngine:
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
-                keys, memory_objs, transfer_spec=transfer_spec
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+                location=store_location,
             )
 
         self.stats_monitor.on_store_finished(

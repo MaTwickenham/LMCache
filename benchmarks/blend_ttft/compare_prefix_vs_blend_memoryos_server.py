@@ -67,6 +67,9 @@ class PrefillRecord:
     chunk_type: str
     prompt_ids: list[int]
     prompt_tokens: int
+    store_location: str | None = None
+    utility_action: str | None = None
+    utility_score: float | None = None
 
 
 @dataclass
@@ -241,6 +244,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-local-gpu-size", type=float, default=4.0)
     parser.add_argument("--blend-check-layers", type=str, default="1")
     parser.add_argument("--blend-recompute-ratios", type=str, default="0.15")
+    parser.add_argument(
+        "--blend-connector-impl",
+        type=str,
+        default="fast",
+        help="LMCache blend connector implementation name.",
+    )
+    parser.add_argument(
+        "--blend-internal-timing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable detailed internal CUDA-event timing inside the blend "
+            "connector. Keep this on for profiling benchmarks; turn it off "
+            "for lower serving overhead."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8013)
     parser.add_argument("--startup-timeout-s", type=float, default=240.0)
     parser.add_argument(
@@ -779,9 +798,16 @@ def build_prefill_records(
     prefill_query_text: str,
     prompt_layout: str,
     max_model_len: int,
+    prefill_plan: dict[str, dict[str, Any]] | None = None,
 ) -> list[PrefillRecord]:
     prefill_records: list[PrefillRecord] = []
     for chunk_id in prefill_order:
+        if prefill_plan is not None:
+            plan = prefill_plan.get(chunk_id)
+            if plan is None or not plan.get("enabled", False):
+                continue
+        else:
+            plan = None
         chunk = unique_chunks[chunk_id]
         prompt_ids = build_prompt_token_ids(
             tokenizer=tokenizer,
@@ -803,6 +829,21 @@ def build_prefill_records(
                 chunk_type=str(chunk.get("type", "unknown")),
                 prompt_ids=prompt_ids,
                 prompt_tokens=len(prompt_ids),
+                store_location=(
+                    str(plan.get("target_location"))
+                    if plan is not None and plan.get("target_location") is not None
+                    else None
+                ),
+                utility_action=(
+                    str(plan.get("action"))
+                    if plan is not None and plan.get("action") is not None
+                    else None
+                ),
+                utility_score=(
+                    float(plan.get("utility"))
+                    if plan is not None and plan.get("utility") is not None
+                    else None
+                ),
             )
         )
     return prefill_records
@@ -944,6 +985,13 @@ def build_blend_lmcache_env(
         env["LMCACHE_MAX_LOCAL_GPU_SIZE"] = str(args.max_local_gpu_size)
     else:
         raise ValueError(f"Unsupported backend: {backend}")
+
+    extra_config = {}
+    if args.blend_connector_impl:
+        extra_config["blend_connector_impl"] = str(args.blend_connector_impl)
+    extra_config["blend_internal_timing"] = bool(args.blend_internal_timing)
+    env["LMCACHE_EXTRA_CONFIG"] = json.dumps(extra_config)
+
     return env
 
 
@@ -1211,6 +1259,14 @@ def add_derived_phase_durations(
     blend_compute_only: dict[str, float] = {}
     retrieve_other: dict[str, float] = {}
     to_gpu_other: dict[str, float] = {}
+    has_to_gpu_internal_breakdown = any(
+        phase in phase_to_request_duration
+        for phase in (
+            "to_gpu_buffer_load_copy_s",
+            "to_gpu_paged_kv_transfer_s",
+            "to_gpu_rope_recover_s",
+        )
+    )
 
     for req_id in request_ids:
         blend_compute_only[req_id] = max(
@@ -1225,17 +1281,19 @@ def add_derived_phase_durations(
             - get_duration("to_gpu_total_s", req_id),
             0.0,
         )
-        to_gpu_other[req_id] = max(
-            get_duration("to_gpu_total_s", req_id)
-            - get_duration("to_gpu_buffer_load_copy_s", req_id)
-            - get_duration("to_gpu_paged_kv_transfer_s", req_id)
-            - get_duration("to_gpu_rope_recover_s", req_id),
-            0.0,
-        )
+        if has_to_gpu_internal_breakdown:
+            to_gpu_other[req_id] = max(
+                get_duration("to_gpu_total_s", req_id)
+                - get_duration("to_gpu_buffer_load_copy_s", req_id)
+                - get_duration("to_gpu_paged_kv_transfer_s", req_id)
+                - get_duration("to_gpu_rope_recover_s", req_id),
+                0.0,
+            )
 
     phase_to_request_duration["blend_compute_only_s"] = blend_compute_only
     phase_to_request_duration["retrieve_other_s"] = retrieve_other
-    phase_to_request_duration["to_gpu_other_s"] = to_gpu_other
+    if has_to_gpu_internal_breakdown:
+        phase_to_request_duration["to_gpu_other_s"] = to_gpu_other
 
 
 def summarize_phase_values(values: list[float]) -> PhaseSummary:

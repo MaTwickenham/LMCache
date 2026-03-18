@@ -62,6 +62,18 @@ class BlendTransferPlan:
     old_positions_cat: Optional[torch.Tensor] = None
 
 
+@dataclass
+class BlendTransferSubset:
+    span_indices: list[int]
+    spans: list[BlendFragmentSpan]
+    dst_starts_tensor: torch.Tensor
+    span_lens_tensor: torch.Tensor
+    position_offsets_tensor: torch.Tensor
+    new_positions_cat: torch.Tensor
+    old_positions_cat: Optional[torch.Tensor] = None
+    old_positions_chunks: Optional[list[torch.Tensor]] = None
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -644,6 +656,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         metadata: LMCacheMetadata,
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
+        **kwargs,
     ) -> "VLLMBufferLayerwiseGPUConnector":
         """Create a connector from LMCacheMetadata.
 
@@ -668,6 +681,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             use_gpu=use_gpu,
             dtype=metadata.kv_dtype,
             device=device,
+            **kwargs,
         )
 
     def _lazy_initialize_buffer(self, kv_caches):
@@ -1084,6 +1098,7 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         self._cached_buffer_shape: Optional[torch.Size] = None
         self._cached_buffer_objs: Optional[list[MemoryObj]] = None
         self._cached_buffer_in_use = False
+        self.enable_internal_timing = bool(kwargs.get("enable_internal_timing", False))
 
     @staticmethod
     def _sum_cuda_event_durations(
@@ -1093,6 +1108,19 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
         for start_event, end_event in event_pairs:
             total_ms += start_event.elapsed_time(end_event)
         return total_ms / 1000.0
+
+    def _maybe_create_timing_event(self) -> Optional[torch.cuda.Event]:
+        if not self.enable_internal_timing:
+            return None
+        return torch.cuda.Event(enable_timing=True)
+
+    @staticmethod
+    def _maybe_record_event(
+        event: Optional[torch.cuda.Event],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        if event is not None:
+            event.record(stream)
 
     def _allocate_layer_buffer(self, buffer_shape: torch.Size) -> MemoryObj:
         assert self.gpu_buffer_allocator is not None
@@ -1278,13 +1306,12 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
     def _can_use_fused_fragment_copy_rope(
         self,
         memory_objs_layer: List[MemoryObj],
-        transfer_plan: BlendTransferPlan,
+        transfer_subset: BlendTransferSubset,
     ) -> bool:
         if (
             not self.cache_positions
             or self.fused_rotary_emb is None
-            or transfer_plan.old_positions_cat is None
-            or transfer_plan.new_positions_cat is None
+            or transfer_subset.old_positions_cat is None
             or not hasattr(lmc_ops, "multi_fragment_copy_rope_kv_fused")
         ):
             return False
@@ -1296,22 +1323,85 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
 
         return True
 
+    def _build_transfer_subset(
+        self,
+        transfer_plan: BlendTransferPlan,
+        span_indices: list[int],
+    ) -> Optional[BlendTransferSubset]:
+        if not span_indices:
+            return None
+
+        spans = [transfer_plan.spans[idx] for idx in span_indices]
+        span_lens = [span.dst_end - span.dst_start for span in spans]
+        position_offsets: list[int] = []
+        current_offset = 0
+        for span_len in span_lens:
+            position_offsets.append(current_offset)
+            current_offset += span_len
+
+        old_positions_chunks = None
+        old_positions_cat = None
+        if transfer_plan.old_positions_chunks is not None:
+            old_positions_chunks = [
+                transfer_plan.old_positions_chunks[idx] for idx in span_indices
+            ]
+            old_positions_cat = torch.cat(old_positions_chunks, dim=0)
+
+        return BlendTransferSubset(
+            span_indices=list(span_indices),
+            spans=spans,
+            dst_starts_tensor=torch.tensor(
+                [span.dst_start for span in spans],
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            span_lens_tensor=torch.tensor(
+                span_lens,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            position_offsets_tensor=torch.tensor(
+                position_offsets,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            new_positions_cat=torch.cat([span.new_positions for span in spans], dim=0),
+            old_positions_cat=old_positions_cat,
+            old_positions_chunks=old_positions_chunks,
+        )
+
+    def _partition_memory_objs_by_device(
+        self,
+        memory_objs_layer: List[MemoryObj],
+    ) -> tuple[list[int], list[int]]:
+        gpu_indices: list[int] = []
+        other_indices: list[int] = []
+        for idx, memory_obj in enumerate(memory_objs_layer):
+            raw_tensor = memory_obj.raw_tensor
+            if raw_tensor is not None and raw_tensor.device == self.device:
+                gpu_indices.append(idx)
+            else:
+                other_indices.append(idx)
+        return gpu_indices, other_indices
+
     def _schedule_fragment_copy_and_rope(
         self,
         layer_id: int,
         buffer_obj: MemoryObj,
         memory_objs_layer: List[MemoryObj],
         transfer_plan: BlendTransferPlan,
+        gpu_subset: Optional[BlendTransferSubset],
+        cpu_subset: Optional[BlendTransferSubset],
         copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
         rope_events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
     ) -> None:
         assert buffer_obj.tensor is not None
         buffer_tensor = buffer_obj.tensor
 
-        copy_start = torch.cuda.Event(enable_timing=True)
-        copy_end = torch.cuda.Event(enable_timing=True)
-        rope_start = torch.cuda.Event(enable_timing=True)
-        rope_end = torch.cuda.Event(enable_timing=True)
+        copy_start = self._maybe_create_timing_event()
+        copy_end = self._maybe_create_timing_event()
+        rope_start = self._maybe_create_timing_event()
+        rope_end = self._maybe_create_timing_event()
         ready_event = torch.cuda.Event()
 
         with torch.cuda.stream(self.load_stream):
@@ -1321,35 +1411,57 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
             ):
                 buffer_tensor[:, transfer_plan.gap_positions, :] = 0.0
 
-            copy_start.record(self.load_stream)
-            if self._can_use_fused_fragment_copy_rope(
-                memory_objs_layer,
-                transfer_plan,
-            ):
+            self._maybe_record_event(copy_start, self.load_stream)
+            use_gpu_fused = gpu_subset is not None and self._can_use_fused_fragment_copy_rope(
+                [memory_objs_layer[idx] for idx in gpu_subset.span_indices],
+                gpu_subset,
+            )
+            if use_gpu_fused:
                 src_ptrs = torch.tensor(
-                    [memory_obj.data_ptr for memory_obj in memory_objs_layer],
+                    [
+                        memory_objs_layer[idx].data_ptr
+                        for idx in gpu_subset.span_indices
+                    ],
                     dtype=torch.int64,
                     device=self.device,
                 )
                 lmc_ops.multi_fragment_copy_rope_kv_fused(
                     src_ptrs,
-                    transfer_plan.dst_starts_tensor,
-                    transfer_plan.span_lens_tensor,
-                    transfer_plan.position_offsets_tensor,
-                    transfer_plan.old_positions_cat,
-                    transfer_plan.new_positions_cat,
+                    gpu_subset.dst_starts_tensor,
+                    gpu_subset.span_lens_tensor,
+                    gpu_subset.position_offsets_tensor,
+                    gpu_subset.old_positions_cat,
+                    gpu_subset.new_positions_cat,
                     buffer_tensor,
                     self.fused_rotary_emb.head_size,
                     self._get_rope_cache(),
                     self.fused_rotary_emb.is_neox_style,
                 )
-                copy_end.record(self.load_stream)
-                rope_start.record(self.load_stream)
-                rope_end.record(self.load_stream)
+
+            slow_subset = cpu_subset
+            if not use_gpu_fused:
+                slow_subset = transfer_plan
+
+            if slow_subset is None:
+                self._maybe_record_event(copy_end, self.load_stream)
+                self._maybe_record_event(rope_start, self.load_stream)
+                self._maybe_record_event(rope_end, self.load_stream)
             else:
-                for span, memory_obj in zip(
-                    transfer_plan.spans, memory_objs_layer, strict=False
+                if isinstance(slow_subset, BlendTransferSubset):
+                    slow_span_indices = slow_subset.span_indices
+                    slow_spans = slow_subset.spans
+                    slow_old_positions_chunks = slow_subset.old_positions_chunks
+                else:
+                    slow_span_indices = list(range(len(transfer_plan.spans)))
+                    slow_spans = transfer_plan.spans
+                    slow_old_positions_chunks = transfer_plan.old_positions_chunks
+
+                for span_idx, span in zip(
+                    slow_span_indices,
+                    slow_spans,
+                    strict=False,
                 ):
+                    memory_obj = memory_objs_layer[span_idx]
                     assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                     assert memory_obj.tensor is not None
 
@@ -1361,14 +1473,14 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
                         memory_obj.tensor[1],
                         non_blocking=True,
                     )
-                copy_end.record(self.load_stream)
+                self._maybe_record_event(copy_end, self.load_stream)
 
-                rope_start.record(self.load_stream)
+                self._maybe_record_event(rope_start, self.load_stream)
                 if self.cache_positions:
-                    assert transfer_plan.old_positions_chunks is not None
+                    assert slow_old_positions_chunks is not None
                     for span, old_positions in zip(
-                        transfer_plan.spans,
-                        transfer_plan.old_positions_chunks,
+                        slow_spans,
+                        slow_old_positions_chunks,
                         strict=False,
                     ):
                         self.fused_rotary_emb(
@@ -1376,11 +1488,13 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
                             span.new_positions,
                             buffer_tensor[0][span.dst_start : span.dst_end],
                         )
-                rope_end.record(self.load_stream)
+                self._maybe_record_event(rope_end, self.load_stream)
             ready_event.record(self.load_stream)
 
-        copy_events.append((copy_start, copy_end))
-        rope_events.append((rope_start, rope_end))
+        if copy_start is not None and copy_end is not None:
+            copy_events.append((copy_start, copy_end))
+        if rope_start is not None and rope_end is not None:
+            rope_events.append((rope_start, rope_end))
         self.layer_ready_events[layer_id] = ready_event
 
     def _schedule_layer_paged_transfer(
@@ -1393,13 +1507,13 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
     ) -> torch.cuda.Event:
         assert buffer_obj.tensor is not None
 
-        transfer_start = torch.cuda.Event(enable_timing=True)
-        transfer_end = torch.cuda.Event(enable_timing=True)
+        transfer_start = self._maybe_create_timing_event()
+        transfer_end = self._maybe_create_timing_event()
         transfer_done = torch.cuda.Event()
 
         with torch.cuda.stream(self.transfer_stream):
             self.transfer_stream.wait_event(layer_ready_event)
-            transfer_start.record(self.transfer_stream)
+            self._maybe_record_event(transfer_start, self.transfer_stream)
             lmc_ops.single_layer_kv_transfer(
                 buffer_obj.tensor,
                 self.kvcaches[layer_id],
@@ -1408,10 +1522,11 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
                 self.gpu_kv_format,
                 token_major=False,
             )
-            transfer_end.record(self.transfer_stream)
+            self._maybe_record_event(transfer_end, self.transfer_stream)
             transfer_done.record(self.transfer_stream)
 
-        transfer_events.append((transfer_start, transfer_end))
+        if transfer_start is not None and transfer_end is not None:
+            transfer_events.append((transfer_start, transfer_end))
         return transfer_done
 
     @_lmcache_nvtx_annotate
@@ -1465,6 +1580,11 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
 
         memory_objs_layer = yield
         self._resolve_old_positions_chunks(transfer_plan, memory_objs_layer)
+        gpu_span_indices, cpu_span_indices = self._partition_memory_objs_by_device(
+            memory_objs_layer
+        )
+        gpu_subset = self._build_transfer_subset(transfer_plan, gpu_span_indices)
+        cpu_subset = self._build_transfer_subset(transfer_plan, cpu_span_indices)
 
         for layer_id in range(self.num_layers):
             release_event = buffer_release_events.pop(load_buffer_idx, None)
@@ -1492,6 +1612,8 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
                 current_buffer_obj,
                 memory_objs_layer,
                 transfer_plan,
+                gpu_subset,
+                cpu_subset,
                 copy_events,
                 rope_events,
             )
@@ -1533,13 +1655,14 @@ class VLLMFastBlendLayerwiseGPUConnector(VLLMBufferLayerwiseGPUConnector):
             "releasing the GPU buffers."
         )
 
-        buffer_load_copy_s = self._sum_cuda_event_durations(copy_events)
-        rope_recover_s = self._sum_cuda_event_durations(rope_events)
-        paged_kv_transfer_s = self._sum_cuda_event_durations(transfer_events)
+        if self.enable_internal_timing:
+            buffer_load_copy_s = self._sum_cuda_event_durations(copy_events)
+            rope_recover_s = self._sum_cuda_event_durations(rope_events)
+            paged_kv_transfer_s = self._sum_cuda_event_durations(transfer_events)
 
-        record_phase(req_id, "to_gpu_buffer_load_copy_s", buffer_load_copy_s)
-        record_phase(req_id, "to_gpu_paged_kv_transfer_s", paged_kv_transfer_s)
-        record_phase(req_id, "to_gpu_rope_recover_s", rope_recover_s)
+            record_phase(req_id, "to_gpu_buffer_load_copy_s", buffer_load_copy_s)
+            record_phase(req_id, "to_gpu_paged_kv_transfer_s", paged_kv_transfer_s)
+            record_phase(req_id, "to_gpu_rope_recover_s", rope_recover_s)
         record_phase(
             req_id,
             "to_gpu_total_s",
