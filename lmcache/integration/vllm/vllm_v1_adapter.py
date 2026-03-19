@@ -58,6 +58,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+EXECUTION_MODE_KEY = "lmcache.execution_mode"
+EXECUTION_MODE_BLEND = "blend"
+EXECUTION_MODE_NATIVE_VLLM = "native_vllm"
+
 
 @dataclass
 class LoadSpec:
@@ -91,16 +95,46 @@ class DisaggSpec:
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
-def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
+def extract_request_configs_from_kv_transfer_params(
+    kv_transfer_params: Optional[dict[str, Any]],
+) -> Optional[dict]:
+    request_configs = None
+    if kv_transfer_params:
+        for k, v in kv_transfer_params.items():
+            if k.startswith("lmcache."):
+                if request_configs is None:
+                    request_configs = {}
+                request_configs[k] = v
+    return request_configs
+
+
+def extract_request_configs(sampling_params: Optional[SamplingParams]) -> Optional[dict]:
     request_configs = None
     if sampling_params and sampling_params.extra_args is not None:
         if kv_transfer_params := sampling_params.extra_args.get("kv_transfer_params"):
-            for k, v in kv_transfer_params.items():
-                if k.startswith("lmcache."):
-                    if request_configs is None:
-                        request_configs = {}
-                    request_configs[k] = v
+            request_configs = extract_request_configs_from_kv_transfer_params(
+                kv_transfer_params
+            )
     return request_configs
+
+
+def extract_request_configs_from_request(request: Any) -> Optional[dict]:
+    request_configs = extract_request_configs_from_kv_transfer_params(
+        getattr(request, "kv_transfer_params", None)
+    )
+    if request_configs is not None:
+        return request_configs
+    return extract_request_configs(getattr(request, "sampling_params", None))
+
+
+def get_execution_mode(request_configs: Optional[dict[str, Any]]) -> str:
+    if not request_configs:
+        return EXECUTION_MODE_BLEND
+
+    mode = request_configs.get(EXECUTION_MODE_KEY, EXECUTION_MODE_BLEND)
+    if mode is None:
+        return EXECUTION_MODE_BLEND
+    return str(mode)
 
 
 @dataclass
@@ -336,6 +370,7 @@ class ReqMeta:
         # NOTE(vladnosiv): for disagg, you cannot skip saving, as saving is a transfer
         # Check if request_configs has lmcache.skip_save set to True
         request_configs = tracker.request_configs or {}
+        execution_mode = get_execution_mode(request_configs)
         request_skip = request_configs.get("lmcache.skip_save", False)
         request_kind = request_configs.get("lmcache.request_kind")
         is_fragment_prefill = request_kind == "fragment_prefill"
@@ -362,6 +397,7 @@ class ReqMeta:
             or delay_fragment_prefill_save
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
+            or execution_mode == EXECUTION_MODE_NATIVE_VLLM
         )
 
         if skip_save and load_spec is None:
@@ -1471,7 +1507,8 @@ class LMCacheConnectorV1Impl:
                 apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
                 token_ids = token_ids.tolist()
 
-            request_configs = extract_request_configs(request.sampling_params)
+            request_configs = extract_request_configs_from_request(request)
+            execution_mode = get_execution_mode(request_configs)
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -1479,11 +1516,28 @@ class LMCacheConnectorV1Impl:
             if request_configs is not None:
                 request_kind = request_configs.get("lmcache.request_kind")
 
+            if execution_mode == EXECUTION_MODE_NATIVE_VLLM:
+                self.lookup_client.clear_lookup_status(req_id)
+                self.load_specs.pop(req_id, None)
+                self._requests_priority.pop(req_id, None)
+                num_external_hit_tokens = 0
+                record_phase(
+                    req_id,
+                    "lookup_total_s",
+                    0.0,
+                    prompt_tokens=len(token_ids),
+                    request_configs=bool(request_configs),
+                    lookup_mode="disabled_native_vllm",
+                    execution_mode=execution_mode,
+                    num_external_hit_tokens=0,
+                    num_computed_tokens=num_computed_tokens,
+                    request_num_tokens=request.num_tokens,
+                )
             # Offline fragment-prefill is the cache materialization stage for
             # Blend. Reusing LMCache during this stage corrupts the benchmark
             # semantics: sparse lookup returns a dense window end and can make
             # the scheduler treat the fragment as already materialized.
-            if request_kind == "fragment_prefill":
+            elif request_kind == "fragment_prefill":
                 num_external_hit_tokens = 0
                 record_phase(
                     req_id,
@@ -1492,6 +1546,7 @@ class LMCacheConnectorV1Impl:
                     prompt_tokens=len(token_ids),
                     request_configs=bool(request_configs),
                     lookup_mode="disabled_fragment_prefill",
+                    execution_mode=execution_mode,
                     num_external_hit_tokens=0,
                     num_computed_tokens=num_computed_tokens,
                     request_num_tokens=request.num_tokens,
@@ -1519,6 +1574,7 @@ class LMCacheConnectorV1Impl:
                     prompt_tokens=len(token_ids),
                     request_configs=bool(request_configs),
                     lookup_mode=lookup_mode or "default",
+                    execution_mode=execution_mode,
                     num_external_hit_tokens=(
                         -1
                         if num_external_hit_tokens is None
