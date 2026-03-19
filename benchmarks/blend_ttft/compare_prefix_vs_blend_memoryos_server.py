@@ -177,9 +177,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default=(
-            "/home/mahaoran/research/compoundai/CacheBlend/example/"
-            "benchmark_e2e/data/processed/memoryos"
+        default=str(
+            Path(__file__).resolve().parents[2] / "data" / "processed" / "memoryos"
         ),
     )
     parser.add_argument(

@@ -81,6 +81,17 @@ lmcache/experimental/tests
 
 # benchmark results
 *.csv
+benchmarks/blend_ttft/analysis_results/
+
+# local benchmark datasets
+/data/*
+!/data/README.md
+!/data/processed/
+/data/processed/*
+!/data/processed/skillsbench/
+/data/processed/skillsbench/*
+!/data/processed/skillsbench/README.md
+!/data/processed/skillsbench/generate_skillsbench_dense.py
 
 # disk cache
 /remote_disk

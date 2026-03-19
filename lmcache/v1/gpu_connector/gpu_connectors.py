@@ -656,6 +656,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.store_stream = torch.cuda.Stream()
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
+        self.layer_ready_events: dict[int, torch.cuda.Event] = {}
 
         # track gap positions between blended chunks
         self.current_gap_positions = None
