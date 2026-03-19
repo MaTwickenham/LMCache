@@ -43,9 +43,8 @@ from runtime_blend_probe import (
 
 
 DEFAULT_MODEL = "/AI/HF_MODELS/Mistral-7B-Instruct-v0.2"
-DEFAULT_DATA_ROOT = (
-    "/home/mahaoran/research/compoundai/CacheBlend/example/"
-    "benchmark_e2e/data/processed"
+DEFAULT_DATA_ROOT = str(
+    Path(__file__).resolve().parents[2] / "data" / "processed"
 )
 
 
@@ -148,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--workload-kind",
-        choices=["memos", "memoryos", "amem"],
+        choices=["memos", "memoryos", "amem", "skillsbench"],
         required=True,
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)

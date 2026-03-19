@@ -116,6 +116,7 @@ def _layer_score(layer: str) -> float:
         "memoryos": 1.0,
         "amem": 1.0,
         "memos": 1.0,
+        "skillsbench": 1.0,
     }
     return float(priors.get(layer, 1.0))
 
@@ -380,4 +381,27 @@ def enrich_id_backed_hints(
             hints["tags"] = list(meta.get("tags") or [])
             hints["graph_in_degree"] = 0
             hints["prior_use_count"] = max(int(hints.get("prior_use_count", 0) or 0), use_count)
+        chunk["hints"] = hints
+
+
+def enrich_skillsbench_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
+    kind_bias = {
+        "skill_md": 0.75,
+        "reference": 0.65,
+        "script": 0.55,
+    }
+    for chunk in unique_chunks.values():
+        hints = dict(chunk.get("hints") or {})
+        task_frequency = max(
+            int(chunk.get("task_frequency", 0) or hints.get("task_frequency", 0) or 1),
+            1,
+        )
+        chunk_type = str(chunk.get("type", "") or "fragment")
+        base_importance = kind_bias.get(chunk_type, 0.6)
+        shared_bonus = min(0.25, 0.08 * _log1p_safe(task_frequency))
+        hints["importance_score"] = _clamp(base_importance + shared_bonus, 0.0, 1.0)
+        hints["graph_in_degree"] = max(task_frequency - 1, 0)
+        hints["task_frequency"] = task_frequency
+        hints["skill_names"] = list(chunk.get("skill_names") or [])
+        hints["source_tasks"] = list(chunk.get("source_tasks") or [])
         chunk["hints"] = hints

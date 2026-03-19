@@ -8,11 +8,12 @@ under explicit local KV-cache budgets. The Blend path can now use:
 2. CPU-only fragment storage.
 3. Tiered GPU+CPU fragment storage, with request-level prefill placement.
 
-The script supports three processed workload formats under
-`example/benchmark_e2e/data/processed`:
+The script supports processed workload formats under
+`LMCache/data/processed`:
 - `memoryos`
 - `amem`
 - `memos`
+- `skillsbench`
 
 For the Blend path, the offline fragment prefill stage stores reusable
 fragment KV in the LMCache GPU backend. Online TTFT is measured from request
@@ -64,11 +65,12 @@ from utility_guided_prefill import (
     attach_prior_use_count,
     enrich_id_backed_hints,
     enrich_memoryos_hints,
+    enrich_skillsbench_hints,
     plan_prefill_placements,
 )
 
 
-WORKLOAD_KIND_CHOICES = ("memoryos", "amem", "memos")
+WORKLOAD_KIND_CHOICES = ("memoryos", "amem", "memos", "skillsbench")
 PROMPT_LAYOUT_CHOICES = ("memory_first", "question_first")
 FRAGMENT_ORDER_POLICY_CHOICES = (
     "auto",
@@ -83,6 +85,7 @@ DEFAULT_DATASETS_BY_WORKLOAD = {
     "memoryos": ["conv26", "conv30", "conv41"],
     "amem": ["conv26", "conv30", "conv41"],
     "memos": ["locomo_conv0", "locomo_conv1", "locomo_conv2"],
+    "skillsbench": ["dense_core"],
 }
 
 
@@ -120,10 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=str,
-        default=(
-            "/home/mahaoran/research/compoundai/CacheBlend/example/"
-            "benchmark_e2e/data/processed"
-        ),
+        default=str(Path(__file__).resolve().parents[2] / "data" / "processed"),
     )
     parser.add_argument(
         "--workload-kind",
@@ -499,7 +499,7 @@ def build_workload(
             traces = traces[:max_qa_per_dataset]
 
         memory_index = None
-        if workload_kind in ("amem", "memos"):
+        if workload_kind in ("amem", "memos", "skillsbench"):
             memory_index = load_memory_index(
                 data_root=data_root,
                 workload_kind=workload_kind,
@@ -512,6 +512,15 @@ def build_workload(
                     qa_trace=qa_trace,
                     tokenizer=tokenizer,
                     unique_chunks=unique_chunks,
+                )
+            elif workload_kind == "skillsbench":
+                assert memory_index is not None
+                chunk_ids = extract_skillsbench_chunks(
+                    dataset=dataset,
+                    qa_trace=qa_trace,
+                    tokenizer=tokenizer,
+                    unique_chunks=unique_chunks,
+                    memory_index=memory_index,
                 )
             else:
                 assert memory_index is not None
@@ -532,6 +541,23 @@ def build_workload(
                 policy=fragment_order_policy,
                 shuffle_seed=shuffle_seed,
             )
+            question_text = str(qa_trace.get("question", ""))
+            if workload_kind == "skillsbench":
+                ordered_chunk_ids, fragment_token_ids, _was_trimmed = trim_fragment_sequence_to_fit(
+                    tokenizer=tokenizer,
+                    system_prompt_ids=system_prompt_ids,
+                    blend_special_ids=blend_special_ids,
+                    ordered_chunk_ids=ordered_chunk_ids,
+                    unique_chunks=unique_chunks,
+                    question_text=question_text,
+                    prompt_layout=prompt_layout,
+                    max_model_len=max_model_len,
+                )
+            else:
+                fragment_token_ids = [
+                    list(unique_chunks[chunk_id]["token_ids"])
+                    for chunk_id in ordered_chunk_ids
+                ]
             query_chunk_ids.append(list(ordered_chunk_ids))
 
             for chunk_id in ordered_chunk_ids:
@@ -540,11 +566,6 @@ def build_workload(
                 prefill_seen.add(chunk_id)
                 prefill_first_seen.append(chunk_id)
 
-            fragment_token_ids = [
-                list(unique_chunks[chunk_id]["token_ids"])
-                for chunk_id in ordered_chunk_ids
-            ]
-            question_text = str(qa_trace.get("question", ""))
             prompt_ids = build_prompt_token_ids(
                 tokenizer=tokenizer,
                 system_prompt_ids=system_prompt_ids,
@@ -593,6 +614,8 @@ def build_workload(
     )
     if workload_kind == "memoryos":
         enrich_memoryos_hints(unique_chunks)
+    elif workload_kind == "skillsbench":
+        enrich_skillsbench_hints(unique_chunks)
     else:
         enrich_id_backed_hints(
             workload_kind=workload_kind,
@@ -753,16 +776,37 @@ def load_trace(
         trace_path = data_root / "amem" / f"amem_{dataset}_qa_trace.json"
     elif workload_kind == "memos":
         trace_path = data_root / "memos" / f"memos_{dataset}_qa_trace.json"
+    elif workload_kind == "skillsbench":
+        trace_path = data_root / "skillsbench" / f"skillsbench_{dataset}_queries.jsonl"
     else:
         raise ValueError(f"Unsupported workload_kind={workload_kind!r}")
 
     if not trace_path.exists():
         raise FileNotFoundError(f"Dataset trace not found: {trace_path}")
-    with trace_path.open("r", encoding="utf-8") as file:
-        loaded = json.load(file)
-    if not isinstance(loaded, list):
-        raise ValueError(f"Expected a list in {trace_path}, got {type(loaded)!r}")
+    if trace_path.suffix == ".jsonl":
+        loaded = load_jsonl(trace_path)
+    else:
+        with trace_path.open("r", encoding="utf-8") as file:
+            loaded = json.load(file)
+        if not isinstance(loaded, list):
+            raise ValueError(f"Expected a list in {trace_path}, got {type(loaded)!r}")
     return loaded
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as file:
+        for line_no, line in enumerate(file, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            row = json.loads(raw)
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Expected JSON object in {path}:{line_no}, got {type(row)!r}"
+                )
+            rows.append(row)
+    return rows
 
 
 def load_memory_index(
@@ -775,21 +819,28 @@ def load_memory_index(
         memory_path = data_root / "amem" / f"amem_{dataset}_memorys.json"
     elif workload_kind == "memos":
         memory_path = data_root / "memos" / f"memos_{dataset}_memorys.json"
+    elif workload_kind == "skillsbench":
+        memory_path = data_root / "skillsbench" / f"skillsbench_{dataset}_fragments.jsonl"
     else:
         raise ValueError(f"Unsupported workload_kind={workload_kind!r}")
 
     if not memory_path.exists():
         raise FileNotFoundError(f"Dataset memory file not found: {memory_path}")
-    with memory_path.open("r", encoding="utf-8") as file:
-        loaded = json.load(file)
-    if not isinstance(loaded, list):
-        raise ValueError(f"Expected a list in {memory_path}, got {type(loaded)!r}")
+    if memory_path.suffix == ".jsonl":
+        loaded = load_jsonl(memory_path)
+    else:
+        with memory_path.open("r", encoding="utf-8") as file:
+            loaded = json.load(file)
+        if not isinstance(loaded, list):
+            raise ValueError(f"Expected a list in {memory_path}, got {type(loaded)!r}")
 
     index: dict[str, dict[str, Any]] = {}
     for item in loaded:
         if not isinstance(item, dict):
             continue
-        memory_id = str(item.get("memory_id", "")).strip()
+        memory_id = str(
+            item.get("memory_id", "") or item.get("fragment_id", "")
+        ).strip()
         if not memory_id:
             continue
         index[memory_id] = item
@@ -944,6 +995,85 @@ def extract_id_backed_chunks(
     return chunk_ids
 
 
+def extract_skillsbench_chunks(
+    *,
+    dataset: str,
+    qa_trace: dict[str, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    unique_chunks: dict[str, dict[str, Any]],
+    memory_index: dict[str, dict[str, Any]],
+) -> list[str]:
+    chunk_ids: list[str] = []
+    for fragment_id in qa_trace.get("fragment_ids") or []:
+        fragment_key = str(fragment_id).strip()
+        if not fragment_key:
+            continue
+        fragment_record = memory_index.get(fragment_key)
+        if fragment_record is None:
+            raise KeyError(
+                f"Missing fragment_id={fragment_key!r} in skillsbench dataset={dataset}"
+            )
+
+        text = str(fragment_record.get("text", "")).strip()
+        if not text:
+            continue
+
+        chunk_id = fragment_key
+        if chunk_id not in unique_chunks:
+            token_ids = list(tokenizer.encode(text, add_special_tokens=False))
+            chunk_type = str(fragment_record.get("kind", "") or "fragment")
+            unique_chunks[chunk_id] = {
+                "chunk_id": chunk_id,
+                "text": text,
+                "token_ids": token_ids,
+                "tokens": len(token_ids),
+                "layer": "skillsbench",
+                "type": chunk_type,
+                "conversation_id": dataset,
+                "memory_id": fragment_key,
+                "task_frequency": int(fragment_record.get("task_count", 0) or 0),
+                "skill_names": list(fragment_record.get("skill_names") or []),
+                "source_tasks": list(fragment_record.get("source_tasks") or []),
+            }
+        chunk_ids.append(chunk_id)
+    return chunk_ids
+
+
+def trim_fragment_sequence_to_fit(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    system_prompt_ids: list[int],
+    blend_special_ids: list[int],
+    ordered_chunk_ids: list[str],
+    unique_chunks: dict[str, dict[str, Any]],
+    question_text: str,
+    prompt_layout: str,
+    max_model_len: int,
+) -> tuple[list[str], list[list[int]], bool]:
+    trimmed_chunk_ids = list(ordered_chunk_ids)
+    while True:
+        fragment_token_ids = [
+            list(unique_chunks[chunk_id]["token_ids"]) for chunk_id in trimmed_chunk_ids
+        ]
+        prompt_ids = build_prompt_token_ids(
+            tokenizer=tokenizer,
+            system_prompt_ids=system_prompt_ids,
+            blend_special_ids=blend_special_ids,
+            fragment_token_ids=fragment_token_ids,
+            question_text=question_text,
+            prompt_layout=prompt_layout,
+        )
+        if len(prompt_ids) <= max_model_len:
+            return trimmed_chunk_ids, fragment_token_ids, len(trimmed_chunk_ids) != len(ordered_chunk_ids)
+        if not trimmed_chunk_ids:
+            raise ValueError(
+                "Prompt length exceeds max_model_len even after dropping all reusable fragments. "
+                f"question_tokens={len(tokenizer.encode(question_text, add_special_tokens=False))}, "
+                f"max_model_len={max_model_len}."
+            )
+        trimmed_chunk_ids.pop()
+
+
 def resolve_sample_id(
     *,
     workload_kind: str,
@@ -955,6 +1085,12 @@ def resolve_sample_id(
         return str(qa_trace.get("sample_id", f"{dataset}:{qa_index}"))
     if workload_kind == "memos":
         return str(qa_trace.get("query_id", f"{dataset}:{qa_index}"))
+    if workload_kind == "skillsbench":
+        return str(
+            qa_trace.get("query_id")
+            or qa_trace.get("task_id")
+            or f"{dataset}:{qa_index}"
+        )
     return f"{workload_kind}:{dataset}:{qa_index}"
 
 
