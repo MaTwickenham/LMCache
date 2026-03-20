@@ -25,10 +25,6 @@ Use the following benchmark paths by intent:
 
 - `benchmark_explicit_fragments.py`: canonical TTFT benchmark path for
   explicit fragment-pool semantics, utility gating, and separated maintenance.
-- `run_single_method_gpu_workload.py` and `run_all_workloads_4methods_gpu_sweep.sh`:
-  batch sweep helpers for legacy nightly runs. These are useful for broad
-  sweeps, but they are not the canonical source of truth for online-only TTFT
-  semantics.
 - `run_pareto_gpu_pool.py`: budget sweep helper for Pareto-style plots.
 - `compare_prefix_vs_blend_cpu.py` and related CPU wrappers: synthetic or
   diagnostic microbenchmarks, not the canonical real-workload TTFT path.
