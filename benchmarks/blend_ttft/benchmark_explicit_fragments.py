@@ -28,7 +28,10 @@ from explicit_fragment_control_plane import (
     LMCacheFragmentRuntime,
     MaintenanceStats,
 )
-from fragment_utility_planner import UtilityPlannerConfig, choose_execution_mode
+from fragment_utility_planner import (
+    UtilityPlannerConfig as OnlineUtilityPlannerConfig,
+    choose_execution_mode,
+)
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.integration.vllm.vllm_v1_adapter import (
     EXECUTION_MODE_BLEND,
@@ -39,6 +42,9 @@ from runtime_blend_probe import (
     build_phase_index,
     build_workload_for_probe,
     normalize_request_id,
+)
+from utility_guided_prefill import (
+    UtilityPlannerConfig as MaintenanceUtilityPlannerConfig,
 )
 
 
@@ -106,9 +112,11 @@ class ExplicitBlendSummary:
     initial_fill_mode: str
     admit_misses_to: str
     gpu_lookahead: int
+    fragment_management_policy: str
     online_execution_policy: str
     online_execution_mode: str
     blend_engine_prefix_caching: bool
+    utility_enable_semantic_hints: bool
     utility_mode_recompute_requests: int
     utility_mode_blend_requests: int
     mean_predicted_recompute_utility_ms: float
@@ -207,6 +215,11 @@ def parse_args() -> argparse.Namespace:
         default="fixed",
     )
     parser.add_argument(
+        "--fragment-management-policy",
+        choices=["static", "utility"],
+        default="static",
+    )
+    parser.add_argument(
         "--online-execution-mode",
         choices=[EXECUTION_MODE_BLEND, EXECUTION_MODE_NATIVE_VLLM],
         default=EXECUTION_MODE_BLEND,
@@ -228,6 +241,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--utility-tail-lambda", type=float, default=0.0)
     parser.add_argument("--utility-gpu-penalty-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--utility-enable-semantic-hints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--utility-enable-cpu-recompute",
         action=argparse.BooleanOptionalAction,
@@ -277,13 +295,24 @@ def build_sampling_params(max_tokens: int) -> SamplingParams:
     )
 
 
-def build_utility_cfg(args: argparse.Namespace) -> UtilityPlannerConfig:
-    return UtilityPlannerConfig.from_specs(
+def build_utility_cfg(args: argparse.Namespace) -> OnlineUtilityPlannerConfig:
+    return OnlineUtilityPlannerConfig.from_specs(
         cost_model_spec=str(args.utility_cost_model or ""),
         tail_lambda=float(args.utility_tail_lambda or 0.0),
         enable_cpu_recompute=bool(args.utility_enable_cpu_recompute),
         native_runtime="recompute",
         hybrid_gate_all_cached_override=False,
+    )
+
+
+def build_fragment_management_cfg(
+    args: argparse.Namespace,
+) -> MaintenanceUtilityPlannerConfig:
+    return MaintenanceUtilityPlannerConfig.from_args(
+        utility_cost_model=str(args.utility_cost_model or ""),
+        tail_lambda=float(args.utility_tail_lambda or 0.0),
+        enable_semantic_hints=bool(args.utility_enable_semantic_hints),
+        gpu_then_cpu_penalty_ms=float(args.utility_gpu_penalty_ms or 0.0),
     )
 
 
@@ -293,7 +322,7 @@ def decide_online_execution_mode(
     record: Any,
     unique_chunks: dict[str, dict[str, Any]],
     snapshot: Any,
-    utility_cfg: UtilityPlannerConfig | None,
+    utility_cfg: OnlineUtilityPlannerConfig | None,
 ) -> tuple[str, dict[str, Any]]:
     if str(args.online_execution_policy) != "utility" or utility_cfg is None:
         return str(args.online_execution_mode), {
@@ -695,9 +724,14 @@ def run_explicit_blend(
 
     env = build_blend_env(args=args, phase_file=phase_file)
     initial_fill_mode = str(args.initial_fill_mode)
-    utility_cfg = (
+    online_utility_cfg = (
         build_utility_cfg(args)
         if str(args.online_execution_policy) == "utility"
+        else None
+    )
+    fragment_management_cfg = (
+        build_fragment_management_cfg(args)
+        if str(args.fragment_management_policy) == "utility"
         else None
     )
     engine_prefix_caching = bool(args.blend_engine_enable_prefix_caching)
@@ -717,12 +751,15 @@ def run_explicit_blend(
                 runtime=runtime,
                 prefill_records=prefill_records,
                 fragment_tokens=fragment_tokens,
+                fragments=dict(workload["unique_chunks"]),
                 cpu_budget_tokens=cpu_budget_tokens,
                 gpu_budget_tokens=gpu_budget_tokens,
                 cpu_enabled=float(args.max_local_cpu_size) > 0,
                 gpu_enabled=float(args.max_local_gpu_size) > 0,
                 admit_misses_to=args.admit_misses_to,
                 gpu_lookahead=int(args.gpu_lookahead),
+                fragment_management_policy=str(args.fragment_management_policy),
+                maintenance_cfg=fragment_management_cfg,
             )
 
             initial_stats = MaintenanceStats()
@@ -765,13 +802,14 @@ def run_explicit_blend(
             maintenance_rows: list[MaintenanceStats] = []
 
             for index, record in enumerate(query_records):
+                pool.reconcile_shadow_locations(list(record.chunk_ids))
                 snapshot = pool.capture_query_reuse(record.chunk_ids)
                 execution_mode, execution_debug = decide_online_execution_mode(
                     args=args,
                     record=record,
                     unique_chunks=workload["unique_chunks"],
                     snapshot=snapshot,
-                    utility_cfg=utility_cfg,
+                    utility_cfg=online_utility_cfg,
                 )
                 query_sampling_params = runtime.make_sampling_params(
                     request_kind="online_blended_query",
@@ -868,9 +906,11 @@ def run_explicit_blend(
         initial_fill_mode=initial_fill_mode,
         admit_misses_to=str(args.admit_misses_to),
         gpu_lookahead=int(args.gpu_lookahead),
+        fragment_management_policy=str(args.fragment_management_policy),
         online_execution_policy=str(args.online_execution_policy),
         online_execution_mode=str(args.online_execution_mode),
         blend_engine_prefix_caching=bool(engine_prefix_caching),
+        utility_enable_semantic_hints=bool(args.utility_enable_semantic_hints),
         utility_mode_recompute_requests=int(recompute_requests),
         utility_mode_blend_requests=int(blend_requests),
         mean_predicted_recompute_utility_ms=mean_or_zero(
@@ -984,12 +1024,14 @@ def main() -> None:
     print_latency_summary("explicit_blend_online", explicit_blend.online)
     print(
         "explicit_blend_mode: "
+        f"fragment_management_policy={explicit_blend.fragment_management_policy} "
         f"online_execution_policy={explicit_blend.online_execution_policy} "
         f"online_execution_mode={explicit_blend.online_execution_mode} "
         f"blend_engine_prefix_caching={explicit_blend.blend_engine_prefix_caching}"
     )
     print(
         "explicit_blend_utility: "
+        f"semantic_hints={explicit_blend.utility_enable_semantic_hints} "
         f"recompute_requests={explicit_blend.utility_mode_recompute_requests} "
         f"blend_requests={explicit_blend.utility_mode_blend_requests} "
         f"mean_pred_recompute_ms={explicit_blend.mean_predicted_recompute_utility_ms:.3f} "

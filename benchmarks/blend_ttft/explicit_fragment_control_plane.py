@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cloudpickle
 import copy
+import math
 import time
 import uuid
 from collections import OrderedDict
@@ -9,6 +10,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from vllm import LLM, SamplingParams
+from utility_guided_prefill import (
+    FragmentTierUtility,
+    UtilityPlannerConfig as MaintenanceUtilityPlannerConfig,
+    estimate_fragment_tier_utilities,
+)
 
 
 TierName = Literal["cpu", "gpu", "miss"]
@@ -16,6 +22,17 @@ TierName = Literal["cpu", "gpu", "miss"]
 LOCAL_CPU_BACKEND = "LocalCPUBackend"
 LOCAL_GPU_BACKEND = "LocalGPUBackend"
 FRAGMENT_REQUEST_CONFIG = {"lmcache.request_kind": "fragment_prefill"}
+
+
+def _is_missing_fragment_error(exc: BaseException, src_backend: str) -> bool:
+    message = str(exc)
+    missing_patterns = (
+        f"Cannot move fragment: not found in {src_backend}.",
+        f"Call to collective_rpc method failed: Cannot move fragment: not found in {src_backend}.",
+        "Cannot move fragment: no pinned keys",
+        "Cannot move fragment: failed to fetch memory objects",
+    )
+    return any(pattern in message for pattern in missing_patterns)
 
 
 def _worker_probe_lmcache_engine(_worker_wrapper: Any) -> dict[str, Any]:
@@ -97,6 +114,49 @@ def _worker_move_fragment(
         "src": src,
         "dst": dst,
     }
+
+
+def _worker_probe_fragment_locations(
+    _worker_wrapper: Any,
+    fragments: dict[str, list[int]],
+    request_configs: dict[str, Any],
+) -> dict[str, str]:
+    from lmcache.integration.vllm.utils import ENGINE_NAME
+    from lmcache.v1.cache_engine import LMCacheEngineBuilder
+
+    engine = LMCacheEngineBuilder.get(ENGINE_NAME)
+    if engine is None or engine.storage_manager is None:
+        raise RuntimeError("LMCache engine/storage manager is not available in worker.")
+
+    locations: dict[str, str] = {}
+    for chunk_id, prompt_ids in fragments.items():
+        if not prompt_ids:
+            locations[chunk_id] = "miss"
+            continue
+
+        gpu_tokens = int(
+            engine.lookup(
+                list(prompt_ids),
+                search_range=[LOCAL_GPU_BACKEND],
+                pin=False,
+                request_configs=request_configs,
+            )
+        )
+        if gpu_tokens >= len(prompt_ids):
+            locations[chunk_id] = "gpu"
+            continue
+
+        cpu_tokens = int(
+            engine.lookup(
+                list(prompt_ids),
+                search_range=[LOCAL_CPU_BACKEND],
+                pin=False,
+                request_configs=request_configs,
+            )
+        )
+        locations[chunk_id] = "cpu" if cpu_tokens >= len(prompt_ids) else "miss"
+
+    return locations
 
 
 def _worker_evict_fragment(
@@ -255,6 +315,39 @@ class LMCacheFragmentRuntime:
         )
         return time.perf_counter() - start
 
+    def probe_fragment_locations(
+        self,
+        fragments: dict[str, list[int]],
+    ) -> dict[str, TierName]:
+        if not fragments:
+            return {}
+
+        self._ensure_worker_engine()
+        worker_results = self._collective_rpc(
+            _worker_probe_fragment_locations,
+            {chunk_id: list(prompt_ids) for chunk_id, prompt_ids in fragments.items()},
+            FRAGMENT_REQUEST_CONFIG,
+        )
+        if not worker_results:
+            raise RuntimeError("LMCache worker residency probe returned no results.")
+
+        merged: dict[str, TierName] = {}
+        for chunk_id in fragments:
+            observed = {
+                str(result.get(chunk_id, "miss"))
+                for result in worker_results
+                if isinstance(result, dict)
+            }
+            if observed == {"gpu"}:
+                merged[chunk_id] = "gpu"
+            elif observed == {"cpu"}:
+                merged[chunk_id] = "cpu"
+            elif observed == {"miss"}:
+                merged[chunk_id] = "miss"
+            else:
+                merged[chunk_id] = "miss"
+        return merged
+
     def evict_fragment(self, prefill_record: Any, *, location: str) -> float:
         self._ensure_worker_engine()
         start = time.perf_counter()
@@ -274,27 +367,46 @@ class ExplicitFragmentPool:
         runtime: LMCacheFragmentRuntime,
         prefill_records: dict[str, Any],
         fragment_tokens: dict[str, int],
+        fragments: dict[str, dict[str, Any]] | None = None,
         cpu_budget_tokens: int,
         gpu_budget_tokens: int,
         cpu_enabled: bool,
         gpu_enabled: bool,
         admit_misses_to: Literal["auto", "cpu", "gpu", "none"] = "auto",
         gpu_lookahead: int = 0,
+        fragment_management_policy: Literal["static", "utility"] = "static",
+        maintenance_cfg: MaintenanceUtilityPlannerConfig | None = None,
     ):
         self.runtime = runtime
         self.prefill_records = prefill_records
         self.fragment_tokens = fragment_tokens
+        self.fragments = fragments or {}
         self.cpu_budget_tokens = max(int(cpu_budget_tokens), 0)
         self.gpu_budget_tokens = max(int(gpu_budget_tokens), 0)
         self.cpu_enabled = bool(cpu_enabled and self.cpu_budget_tokens > 0)
         self.gpu_enabled = bool(gpu_enabled and self.gpu_budget_tokens > 0)
         self.admit_misses_to = admit_misses_to
         self.gpu_lookahead = max(int(gpu_lookahead), 0)
+        self.fragment_management_policy = str(fragment_management_policy or "static")
+        self.maintenance_cfg = (
+            maintenance_cfg
+            if self.fragment_management_policy == "utility"
+            else None
+        )
 
         self.cpu_lru: OrderedDict[str, None] = OrderedDict()
         self.gpu_lru: OrderedDict[str, None] = OrderedDict()
         self.cpu_used_tokens = 0
         self.gpu_used_tokens = 0
+        self.query_index = 0
+        self.access_counts: dict[str, int] = {}
+        self.last_access_query_idx: dict[str, int] = {}
+
+    def _utility_policy_enabled(self) -> bool:
+        return (
+            self.fragment_management_policy == "utility"
+            and self.maintenance_cfg is not None
+        )
 
     def _touch(self, chunk_id: str) -> None:
         if chunk_id in self.gpu_lru:
@@ -353,16 +465,228 @@ class ExplicitFragmentPool:
             tier, self._tier_used(tier) + int(self.fragment_tokens[chunk_id])
         )
 
-    def _evict_one_cpu(self) -> MaintenanceStats:
-        if not self.cpu_lru:
+    def _set_shadow_location(self, chunk_id: str, tier: TierName) -> None:
+        self._remove_from_tier_state(chunk_id, "gpu")
+        self._remove_from_tier_state(chunk_id, "cpu")
+        if tier != "miss":
+            self._insert_into_tier_state(chunk_id, tier)
+
+    def _fragment_meta(self, chunk_id: str) -> dict[str, Any]:
+        return dict(self.fragments.get(chunk_id) or {})
+
+    def _queries_since_access(self, chunk_id: str) -> int | None:
+        last_seen = self.last_access_query_idx.get(chunk_id)
+        if last_seen is None:
+            return None
+        return max(self.query_index - int(last_seen), 0)
+
+    def _chunk_utility(self, chunk_id: str) -> FragmentTierUtility:
+        cfg = self.maintenance_cfg
+        if cfg is None:
+            raise RuntimeError("Chunk utility requested without maintenance config.")
+
+        meta = self._fragment_meta(chunk_id)
+        return estimate_fragment_tier_utilities(
+            layer=str(meta.get("layer", "unknown")),
+            kind=str(meta.get("type") or meta.get("memory_type") or ""),
+            tokens=int(self.fragment_tokens.get(chunk_id, 0) or 0),
+            hints=dict(meta.get("hints") or {}),
+            cfg=cfg,
+            access_count=int(self.access_counts.get(chunk_id, 0) or 0),
+            queries_since_access=self._queries_since_access(chunk_id),
+            has_cpu_fallback=self.cpu_enabled,
+        )
+
+    def _value_density(self, chunk_id: str, value: float) -> float:
+        tokens = max(int(self.fragment_tokens.get(chunk_id, 0) or 0), 1)
+        return float(value) / float(tokens)
+
+    def _soft_size_priority(self, chunk_id: str, value: float) -> float:
+        tokens = max(int(self.fragment_tokens.get(chunk_id, 0) or 0), 1)
+        return float(value) / math.sqrt(float(tokens))
+
+    def _gpu_admission_value(self, utility: FragmentTierUtility) -> float:
+        if self.cpu_enabled:
+            return float(utility.gpu_premium_admit)
+        return float(utility.admit_gpu)
+
+    def _admission_candidates_with_scores(
+        self,
+        chunk_id: str,
+    ) -> list[tuple[TierName, float, float]]:
+        if not self._utility_policy_enabled():
+            target_tier = self._resolve_admission_tier(chunk_id=chunk_id)
+            if target_tier == "miss":
+                return []
+            return [(target_tier, 0.0, 0.0)]
+
+        utility = self._chunk_utility(chunk_id)
+        scored_candidates: list[tuple[TierName, float, float]] = []
+        if self.cpu_enabled and utility.admit_cpu > 0.0:
+            cpu_value = float(utility.admit_cpu)
+            scored_candidates.append(
+                ("cpu", cpu_value, self._value_density(chunk_id, cpu_value))
+            )
+        else:
+            gpu_value = self._gpu_admission_value(utility)
+            if self.gpu_enabled and gpu_value > 0.0:
+                scored_candidates.append(
+                    (
+                        "gpu",
+                        float(gpu_value),
+                        self._soft_size_priority(chunk_id, gpu_value),
+                    )
+                )
+        scored_candidates.sort(key=lambda item: (item[2], item[1]), reverse=True)
+        return scored_candidates
+
+    def _admission_priority(self, chunk_id: str) -> tuple[float, float]:
+        candidates = self._admission_candidates_with_scores(chunk_id)
+        if not candidates:
+            return (0.0, 0.0)
+        _tier, value, density = candidates[0]
+        return float(density), float(value)
+
+    def _gpu_promotion_priority(self, chunk_id: str) -> tuple[float, float]:
+        if self._location_of(chunk_id) != "cpu":
+            return (0.0, 0.0)
+        value = self._gpu_priority_for_chunk(chunk_id, current_tier="cpu")
+        if value <= 0.0:
+            return (0.0, 0.0)
+        return self._soft_size_priority(chunk_id, value), float(value)
+
+    def _promote_current_cpu_working_set(
+        self,
+        chunk_ids: list[str],
+    ) -> MaintenanceStats:
+        if not (self._utility_policy_enabled() and self.gpu_enabled):
             return MaintenanceStats()
-        victim, _ = self.cpu_lru.popitem(last=False)
+
+        stats = MaintenanceStats()
+        promotion_candidates = [
+            chunk_id
+            for chunk_id in chunk_ids
+            if self._location_of(chunk_id) == "cpu"
+            and self._gpu_priority_for_chunk(chunk_id, current_tier="cpu") > 0.0
+        ]
+        promotion_candidates.sort(
+            key=self._gpu_promotion_priority,
+            reverse=True,
+        )
+        for chunk_id in promotion_candidates:
+            if self._location_of(chunk_id) != "cpu":
+                continue
+            stats.absorb(self.materialize_or_move(chunk_id, target_tier="gpu"))
+        return stats
+
+    def _cpu_value_for_chunk(
+        self,
+        chunk_id: str,
+        *,
+        current_tier: TierName | None = None,
+    ) -> float:
+        utility = self._chunk_utility(chunk_id)
+        location = current_tier or self._location_of(chunk_id)
+        return float(utility.admit_cpu if location == "miss" else utility.keep_cpu)
+
+    def _gpu_priority_for_chunk(
+        self,
+        chunk_id: str,
+        *,
+        current_tier: TierName | None = None,
+    ) -> float:
+        utility = self._chunk_utility(chunk_id)
+        location = current_tier or self._location_of(chunk_id)
+        if location == "miss":
+            return float(utility.gpu_premium_admit)
+        if location == "cpu":
+            return float(utility.gpu_premium_keep)
+        return float(utility.keep_gpu)
+
+    def _select_cpu_victim(self) -> tuple[str, float] | None:
+        if not self.cpu_lru:
+            return None
+        if not self._utility_policy_enabled():
+            victim = next(iter(self.cpu_lru))
+            return victim, 0.0
+
+        victim_id: str | None = None
+        victim_value = float("inf")
+        for chunk_id in self.cpu_lru:
+            keep_value = float(self._chunk_utility(chunk_id).keep_cpu)
+            if victim_id is None or keep_value < victim_value:
+                victim_id = chunk_id
+                victim_value = keep_value
+        if victim_id is None:
+            return None
+        return victim_id, victim_value
+
+    def _select_gpu_victim(self) -> tuple[str, float] | None:
+        if not self.gpu_lru:
+            return None
+        if not self._utility_policy_enabled():
+            victim = next(iter(self.gpu_lru))
+            return victim, 0.0
+
+        victim_id: str | None = None
+        victim_value = float("inf")
+        for chunk_id in self.gpu_lru:
+            keep_value = float(self._chunk_utility(chunk_id).gpu_premium_keep)
+            if victim_id is None or keep_value < victim_value:
+                victim_id = chunk_id
+                victim_value = keep_value
+        if victim_id is None:
+            return None
+        return victim_id, victim_value
+
+    def reconcile_shadow_locations(
+        self,
+        chunk_ids: list[str],
+        *,
+        probe_shadow_misses: bool = False,
+    ) -> dict[str, TierName]:
+        unique_chunk_ids: list[str] = []
+        seen: set[str] = set()
+        fragments_to_probe: dict[str, list[int]] = {}
+
+        for chunk_id in chunk_ids:
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            unique_chunk_ids.append(chunk_id)
+            current = self._location_of(chunk_id)
+            if current == "miss" and not probe_shadow_misses:
+                continue
+            fragments_to_probe[chunk_id] = list(self.prefill_records[chunk_id].prompt_ids)
+
+        if fragments_to_probe:
+            actual_locations = self.runtime.probe_fragment_locations(fragments_to_probe)
+            for chunk_id, actual in actual_locations.items():
+                if self._location_of(chunk_id) != actual:
+                    self._set_shadow_location(chunk_id, actual)
+
+        return {chunk_id: self._location_of(chunk_id) for chunk_id in unique_chunk_ids}
+
+    def _reconcile_chunk_location(
+        self,
+        chunk_id: str,
+        *,
+        probe_shadow_miss: bool = False,
+    ) -> TierName:
+        return self.reconcile_shadow_locations(
+            [chunk_id],
+            probe_shadow_misses=probe_shadow_miss,
+        ).get(chunk_id, "miss")
+
+    def _evict_cpu_chunk(self, victim: str) -> MaintenanceStats:
+        if self._reconcile_chunk_location(victim) != "cpu":
+            return MaintenanceStats()
         wall_s = self.runtime.evict_fragment(
             self.prefill_records[victim],
             location=LOCAL_CPU_BACKEND,
         )
+        self._remove_from_tier_state(victim, "cpu")
         tokens = int(self.fragment_tokens[victim])
-        self.cpu_used_tokens = max(self.cpu_used_tokens - tokens, 0)
         return MaintenanceStats(
             wall_s=wall_s,
             evict_s=wall_s,
@@ -370,33 +694,146 @@ class ExplicitFragmentPool:
             evicted_tokens=tokens,
         )
 
-    def _make_room_cpu(self, needed_tokens: int) -> MaintenanceStats:
+    def _evict_one_cpu(self) -> MaintenanceStats:
+        victim = self._select_cpu_victim()
+        if victim is None:
+            return MaintenanceStats()
+        return self._evict_cpu_chunk(victim[0])
+
+    def _make_room_cpu(
+        self,
+        needed_tokens: int,
+        *,
+        incoming_value: float | None = None,
+    ) -> MaintenanceStats:
         stats = MaintenanceStats()
+        cumulative_loss = 0.0
         while (
             self.cpu_enabled
             and self.cpu_used_tokens + needed_tokens > self.cpu_budget_tokens
             and self.cpu_lru
         ):
-            stats.absorb(self._evict_one_cpu())
+            victim = self._select_cpu_victim()
+            if victim is None:
+                break
+            victim_id, victim_value = victim
+            loss = max(float(victim_value), 0.0)
+            if incoming_value is not None and cumulative_loss + loss >= incoming_value:
+                break
+            cumulative_loss += loss
+            stats.absorb(self._evict_cpu_chunk(victim_id))
         return stats
 
-    def _demote_one_gpu(self) -> MaintenanceStats:
-        if not self.gpu_lru:
+    def _demote_gpu_chunk(self, victim: str) -> MaintenanceStats:
+        if victim not in self.gpu_lru:
             return MaintenanceStats()
-        victim, _ = self.gpu_lru.popitem(last=False)
         tokens = int(self.fragment_tokens[victim])
         stats = MaintenanceStats()
 
-        if self.cpu_enabled and tokens <= self.cpu_budget_tokens:
-            stats.absorb(self._make_room_cpu(tokens))
-            if self.cpu_used_tokens + tokens <= self.cpu_budget_tokens:
-                wall_s = self.runtime.move_fragment(
-                    self.prefill_records[victim],
-                    src=LOCAL_GPU_BACKEND,
-                    dst=LOCAL_CPU_BACKEND,
-                    remove_src=True,
+        keep_on_cpu = (not self._utility_policy_enabled()) or (
+            self._cpu_value_for_chunk(victim, current_tier="gpu") > 0.0
+        )
+        incoming_cpu_value = (
+            self._cpu_value_for_chunk(victim, current_tier="gpu")
+            if self._utility_policy_enabled()
+            else None
+        )
+
+        actual_location = self._reconcile_chunk_location(victim)
+        if actual_location == "cpu":
+            return stats
+        if actual_location == "miss":
+            fallback_cpu_value = (
+                self._cpu_value_for_chunk(victim, current_tier="miss")
+                if self._utility_policy_enabled()
+                else None
+            )
+            fallback_keep_on_cpu = (not self._utility_policy_enabled()) or (
+                (fallback_cpu_value or 0.0) > 0.0
+            )
+            if (
+                self.cpu_enabled
+                and tokens <= self.cpu_budget_tokens
+                and fallback_keep_on_cpu
+            ):
+                stats.absorb(
+                    self._make_room_cpu(
+                        tokens,
+                        incoming_value=fallback_cpu_value,
+                    )
                 )
-                self.gpu_used_tokens = max(self.gpu_used_tokens - tokens, 0)
+                if self.cpu_used_tokens + tokens <= self.cpu_budget_tokens:
+                    wall_s = self.runtime.materialize_fragment(
+                        self.prefill_records[victim],
+                        location=LOCAL_CPU_BACKEND,
+                    )
+                    self._insert_into_tier_state(victim, "cpu")
+                    stats.absorb(
+                        MaintenanceStats(
+                            wall_s=wall_s,
+                            materialize_s=wall_s,
+                            admitted_chunks=1,
+                            admitted_tokens=tokens,
+                        )
+                    )
+            return stats
+        if actual_location != "gpu":
+            return stats
+
+        if (
+            self.cpu_enabled
+            and tokens <= self.cpu_budget_tokens
+            and keep_on_cpu
+        ):
+            stats.absorb(
+                self._make_room_cpu(
+                    tokens,
+                    incoming_value=incoming_cpu_value,
+                )
+            )
+            if self.cpu_used_tokens + tokens <= self.cpu_budget_tokens:
+                try:
+                    wall_s = self.runtime.move_fragment(
+                        self.prefill_records[victim],
+                        src=LOCAL_GPU_BACKEND,
+                        dst=LOCAL_CPU_BACKEND,
+                        remove_src=True,
+                    )
+                except Exception as exc:
+                    if not _is_missing_fragment_error(exc, LOCAL_GPU_BACKEND):
+                        raise
+                    self._remove_from_tier_state(victim, "gpu")
+                    fallback_cpu_value = (
+                        self._cpu_value_for_chunk(victim, current_tier="miss")
+                        if self._utility_policy_enabled()
+                        else None
+                    )
+                    fallback_keep_on_cpu = (not self._utility_policy_enabled()) or (
+                        (fallback_cpu_value or 0.0) > 0.0
+                    )
+                    if self.cpu_enabled and fallback_keep_on_cpu:
+                        stats.absorb(
+                            self._make_room_cpu(
+                                tokens,
+                                incoming_value=fallback_cpu_value,
+                            )
+                        )
+                        if self.cpu_used_tokens + tokens <= self.cpu_budget_tokens:
+                            wall_s = self.runtime.materialize_fragment(
+                                self.prefill_records[victim],
+                                location=LOCAL_CPU_BACKEND,
+                            )
+                            self._insert_into_tier_state(victim, "cpu")
+                            stats.absorb(
+                                MaintenanceStats(
+                                    wall_s=wall_s,
+                                    materialize_s=wall_s,
+                                    admitted_chunks=1,
+                                    admitted_tokens=tokens,
+                                )
+                            )
+                    return stats
+                self._remove_from_tier_state(victim, "gpu")
                 self._insert_into_tier_state(victim, "cpu")
                 stats.absorb(
                     MaintenanceStats(
@@ -412,7 +849,7 @@ class ExplicitFragmentPool:
             self.prefill_records[victim],
             location=LOCAL_GPU_BACKEND,
         )
-        self.gpu_used_tokens = max(self.gpu_used_tokens - tokens, 0)
+        self._remove_from_tier_state(victim, "gpu")
         stats.absorb(
             MaintenanceStats(
                 wall_s=wall_s,
@@ -423,14 +860,34 @@ class ExplicitFragmentPool:
         )
         return stats
 
-    def _make_room_gpu(self, needed_tokens: int) -> MaintenanceStats:
+    def _demote_one_gpu(self) -> MaintenanceStats:
+        victim = self._select_gpu_victim()
+        if victim is None:
+            return MaintenanceStats()
+        return self._demote_gpu_chunk(victim[0])
+
+    def _make_room_gpu(
+        self,
+        needed_tokens: int,
+        *,
+        incoming_value: float | None = None,
+    ) -> MaintenanceStats:
         stats = MaintenanceStats()
+        cumulative_loss = 0.0
         while (
             self.gpu_enabled
             and self.gpu_used_tokens + needed_tokens > self.gpu_budget_tokens
             and self.gpu_lru
         ):
-            stats.absorb(self._demote_one_gpu())
+            victim = self._select_gpu_victim()
+            if victim is None:
+                break
+            victim_id, victim_value = victim
+            loss = max(float(victim_value), 0.0)
+            if incoming_value is not None and cumulative_loss + loss >= incoming_value:
+                break
+            cumulative_loss += loss
+            stats.absorb(self._demote_gpu_chunk(victim_id))
         return stats
 
     def capture_query_reuse(self, chunk_ids: list[str]) -> QueryReuseSnapshot:
@@ -476,6 +933,8 @@ class ExplicitFragmentPool:
 
     def note_query_access(self, chunk_ids: list[str]) -> None:
         for chunk_id in chunk_ids:
+            self.access_counts[chunk_id] = int(self.access_counts.get(chunk_id, 0)) + 1
+            self.last_access_query_idx[chunk_id] = int(self.query_index)
             self._touch(chunk_id)
 
     def seed_initial_resident_pool(
@@ -513,7 +972,21 @@ class ExplicitFragmentPool:
                 break
         return stats
 
-    def _resolve_admission_tier(self) -> TierName:
+    def _resolve_admission_tier(
+        self,
+        *,
+        chunk_id: str | None = None,
+    ) -> TierName:
+        if self._utility_policy_enabled() and chunk_id is not None:
+            utility = self._chunk_utility(chunk_id)
+            candidates: list[tuple[TierName, float]] = [("miss", 0.0)]
+            if self.cpu_enabled:
+                candidates.append(("cpu", float(utility.admit_cpu)))
+            if self.gpu_enabled:
+                candidates.append(("gpu", float(utility.admit_gpu)))
+            best_tier, best_value = max(candidates, key=lambda item: item[1])
+            return best_tier if best_value > 0.0 else "miss"
+
         if self.admit_misses_to == "cpu":
             return "cpu"
         if self.admit_misses_to == "gpu":
@@ -526,6 +999,22 @@ class ExplicitFragmentPool:
             return "gpu"
         return "miss"
 
+    def _admission_candidates(self, chunk_id: str) -> list[TierName]:
+        return [
+            tier
+            for tier, _value, _density in self._admission_candidates_with_scores(chunk_id)
+        ]
+
+    def _should_prefetch_to_gpu(self, chunk_id: str) -> bool:
+        if not self.gpu_enabled:
+            return False
+        current = self._location_of(chunk_id)
+        if current == "gpu":
+            return False
+        if not self._utility_policy_enabled():
+            return True
+        return self._gpu_priority_for_chunk(chunk_id, current_tier=current) > 0.0
+
     def materialize_or_move(
         self,
         chunk_id: str,
@@ -533,6 +1022,8 @@ class ExplicitFragmentPool:
         target_tier: TierName,
     ) -> MaintenanceStats:
         current = self._location_of(chunk_id)
+        if current != "miss":
+            current = self._reconcile_chunk_location(chunk_id)
         tokens = int(self.fragment_tokens[chunk_id])
         if target_tier == "miss" or current == target_tier:
             self._touch(chunk_id)
@@ -544,11 +1035,31 @@ class ExplicitFragmentPool:
 
         stats = MaintenanceStats()
         if target_tier == "gpu":
-            stats.absorb(self._make_room_gpu(tokens))
+            incoming_gpu_value = (
+                self._gpu_priority_for_chunk(chunk_id, current_tier=current)
+                if self._utility_policy_enabled()
+                else None
+            )
+            stats.absorb(
+                self._make_room_gpu(
+                    tokens,
+                    incoming_value=incoming_gpu_value,
+                )
+            )
             if self.gpu_used_tokens + tokens > self.gpu_budget_tokens:
                 return stats
         else:
-            stats.absorb(self._make_room_cpu(tokens))
+            incoming_cpu_value = (
+                self._cpu_value_for_chunk(chunk_id, current_tier=current)
+                if self._utility_policy_enabled()
+                else None
+            )
+            stats.absorb(
+                self._make_room_cpu(
+                    tokens,
+                    incoming_value=incoming_cpu_value,
+                )
+            )
             if self.cpu_used_tokens + tokens > self.cpu_budget_tokens:
                 return stats
 
@@ -570,12 +1081,32 @@ class ExplicitFragmentPool:
             return stats
 
         src_backend = self._tier_backend_name(current)
-        wall_s = self.runtime.move_fragment(
-            self.prefill_records[chunk_id],
-            src=src_backend,
-            dst=target_backend,
-            remove_src=True,
-        )
+        try:
+            wall_s = self.runtime.move_fragment(
+                self.prefill_records[chunk_id],
+                src=src_backend,
+                dst=target_backend,
+                remove_src=True,
+            )
+        except Exception as exc:
+            if not _is_missing_fragment_error(exc, src_backend):
+                raise
+            self._remove_from_tier_state(chunk_id, current)
+            wall_s = self.runtime.materialize_fragment(
+                self.prefill_records[chunk_id],
+                location=target_backend,
+            )
+            self._insert_into_tier_state(chunk_id, target_tier)
+            stats.absorb(
+                MaintenanceStats(
+                    wall_s=wall_s,
+                    materialize_s=wall_s,
+                    admitted_chunks=1,
+                    admitted_tokens=tokens,
+                )
+            )
+            return stats
+
         self._remove_from_tier_state(chunk_id, current)
         self._insert_into_tier_state(chunk_id, target_tier)
         if current == "cpu" and target_tier == "gpu":
@@ -607,24 +1138,42 @@ class ExplicitFragmentPool:
         start = time.perf_counter()
         stats = MaintenanceStats()
 
+        unique_current_chunk_ids = list(dict.fromkeys(str(chunk_id) for chunk_id in current_chunk_ids))
         self.note_query_access(current_chunk_ids)
-        target_tier = self._resolve_admission_tier()
-        if target_tier != "miss":
-            for chunk_id in current_chunk_ids:
-                if self._location_of(chunk_id) != "miss":
-                    continue
+        stats.absorb(self._promote_current_cpu_working_set(unique_current_chunk_ids))
+
+        admission_candidates = [
+            chunk_id
+            for chunk_id in unique_current_chunk_ids
+            if self._location_of(chunk_id) == "miss"
+        ]
+        if self._utility_policy_enabled():
+            admission_candidates.sort(
+                key=self._admission_priority,
+                reverse=True,
+            )
+
+        for chunk_id in admission_candidates:
+            if self._location_of(chunk_id) != "miss":
+                continue
+            for target_tier in self._admission_candidates(chunk_id):
                 stats.absorb(
                     self.materialize_or_move(chunk_id, target_tier=target_tier)
                 )
+                if self._location_of(chunk_id) == target_tier:
+                    break
+
+        stats.absorb(self._promote_current_cpu_working_set(unique_current_chunk_ids))
 
         if self.gpu_enabled and self.gpu_lookahead > 0 and next_chunk_ids:
             for chunk_id in next_chunk_ids:
-                if self._location_of(chunk_id) == "gpu":
+                if not self._should_prefetch_to_gpu(chunk_id):
                     continue
                 stats.absorb(
                     self.materialize_or_move(chunk_id, target_tier="gpu")
                 )
 
+        self.query_index += 1
         stats.wall_s = time.perf_counter() - start
         return stats
 
