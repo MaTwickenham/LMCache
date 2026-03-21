@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from compare_prefix_vs_blend_gpu_workload_server import (
     append_token_segment,
     apply_prefill_order_policy,
+    attach_prior_use_count,
     build_prefill_plan,
     build_prefill_records,
     build_prompt_token_ids,
@@ -171,6 +172,11 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
                     memory_prefix_tokens=memory_prefix_tokens,
                 )
             )
+
+    attach_prior_use_count(
+        unique_chunks=unique_chunks,
+        query_chunk_ids=query_chunk_ids,
+    )
 
     if args.workload_kind == "memoryos":
         enrich_memoryos_hints(unique_chunks)
