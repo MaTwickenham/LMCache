@@ -21,6 +21,8 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -29,8 +31,12 @@ import torch
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend.storage_manager import StorageManager
+from lmcache.v1.storage_backend.storage_manager import (
+    StorageManager,
+    allocate_and_copy_objects,
+)
 
 
 class MockMemoryObj:
@@ -57,6 +63,49 @@ class MockAsyncLookupServer:
 
     def send_response_to_scheduler(self, lookup_id: str, retrieved_length: int):
         self.responses.append((lookup_id, retrieved_length))
+
+
+class MockTensorMemoryObj:
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        fmt: MemoryFormat = MemoryFormat.KV_2TD,
+        cached_positions: torch.Tensor | None = None,
+    ):
+        self._tensor = tensor
+        self.meta = SimpleNamespace(fmt=fmt)
+        self._metadata = SimpleNamespace(cached_positions=cached_positions)
+
+    def get_shape(self):
+        return self._tensor.shape
+
+    def get_dtype(self):
+        return self._tensor.dtype
+
+    @property
+    def tensor(self):
+        return self._tensor
+
+    @property
+    def metadata(self):
+        return self._metadata
+
+
+class MockAllocatorBackend:
+    def __init__(self, existing_keys: set[str]):
+        self.existing_keys = set(existing_keys)
+
+    def contains(self, key: str):
+        return key in self.existing_keys
+
+    def allocate(self, shape, dtype, fmt, eviction=True, busy_loop=False):
+        tensor = torch.empty(shape, dtype=dtype)
+        return MockTensorMemoryObj(tensor=tensor, fmt=fmt)
+
+
+class MockStream:
+    def synchronize(self):
+        return None
 
 
 @pytest.fixture
@@ -317,3 +366,35 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+
+def test_allocate_and_copy_objects_preserves_key_alignment_when_skipping_existing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+
+    src_memory_objs = [
+        MockTensorMemoryObj(torch.full((1, 2), 10.0, dtype=torch.float32)),
+        MockTensorMemoryObj(
+            torch.full((2, 2), 20.0, dtype=torch.float32),
+            cached_positions=torch.tensor([3, 4], dtype=torch.int64),
+        ),
+        MockTensorMemoryObj(torch.full((3, 2), 30.0, dtype=torch.float32)),
+    ]
+    backend = MockAllocatorBackend(existing_keys={"k0"})
+
+    copied_keys, copied_objs = allocate_and_copy_objects(
+        allocator_backend=backend,
+        keys=["k0", "k1", "k2"],
+        src_memory_objs=src_memory_objs,
+        stream=MockStream(),
+    )
+
+    assert list(copied_keys) == ["k1", "k2"]
+    assert len(copied_objs) == 2
+    assert torch.equal(copied_objs[0].tensor, src_memory_objs[1].tensor)
+    assert torch.equal(copied_objs[1].tensor, src_memory_objs[2].tensor)
+    assert torch.equal(
+        copied_objs[0].metadata.cached_positions,
+        src_memory_objs[1].metadata.cached_positions,
+    )

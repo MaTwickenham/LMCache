@@ -793,24 +793,42 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
-        num_all_tokens = ends[-1] - starts[0]
-        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
+        dense_window_start = kwargs.get("dense_window_start")
+        dense_window_end = kwargs.get("dense_window_end")
+        buf_offset = starts[0] if dense_window_start is None else dense_window_start
+        window_end = ends[-1] if dense_window_end is None else dense_window_end
+        if buf_offset > starts[0]:
+            raise ValueError(
+                "dense_window_start cannot be greater than the first retrieved span"
+            )
+        if window_end < ends[-1]:
+            raise ValueError(
+                "dense_window_end cannot be smaller than the last retrieved span"
+            )
+
+        # Legacy blend still feeds Blender a dense window even when some
+        # fragments inside that window miss. Anchor the buffer to the requested
+        # dense window rather than the first retrieved span so missing prefixes
+        # remain explicit zero-filled gaps instead of shrinking the buffer.
+        num_all_tokens = window_end - buf_offset
+        slot_mapping_full = slot_mapping[buf_offset:window_end]
 
         # compute gap positions
         gap_mask = torch.ones(
             num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
         )
-        buf_offset = starts[0]
 
         for start, end in zip(starts, ends, strict=False):
             gap_mask[start - buf_offset : end - buf_offset] = False
 
         self.current_gap_positions = torch.where(gap_mask)[0]
 
-        buf_offset = starts[0]
         if self.cache_positions:
             new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+                buf_offset,
+                window_end,
+                dtype=torch.int64,
+                device=self.kvcaches[0].device,
             )
 
         buffer_shape = self.get_shape(num_all_tokens)
