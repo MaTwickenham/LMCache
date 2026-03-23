@@ -43,6 +43,7 @@ from runtime_blend_probe import (
     build_workload_for_probe,
     normalize_request_id,
 )
+from compare_prefix_vs_blend_gpu_workload_server import summarize_prefill_plan
 from utility_guided_prefill import (
     UtilityPlannerConfig as MaintenanceUtilityPlannerConfig,
 )
@@ -52,6 +53,7 @@ DEFAULT_MODEL = "/AI/HF_MODELS/Mistral-7B-Instruct-v0.2"
 DEFAULT_DATA_ROOT = str(
     Path(__file__).resolve().parents[2] / "data" / "processed"
 )
+METHOD_CHOICES = ("no_prefix", "native_prefix", "explicit_blend")
 
 
 def blend_cpu_bench_module() -> Any:
@@ -140,9 +142,9 @@ class BenchmarkResult:
     datasets: list[str]
     chunk_size: int
     workload: WorkloadStats
-    no_prefix: LatencySummary
-    native_prefix: LatencySummary
-    explicit_blend: ExplicitBlendSummary
+    no_prefix: LatencySummary | None
+    native_prefix: LatencySummary | None
+    explicit_blend: ExplicitBlendSummary | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,12 +157,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--workload-kind",
-        choices=["memos", "memoryos", "amem", "skillsbench"],
+        choices=["memos", "memoryos", "amem", "skillsbench", "dspy_locomo", "memgas"],
         required=True,
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--out-dir", type=str, default="")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated dataset names. If omitted, use the default "
+            "datasets for the selected workload."
+        ),
+    )
     parser.add_argument("--cuda-visible-devices", type=str, default="0")
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--max-local-gpu-size", type=float, default=0.0)
@@ -269,6 +280,23 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--gpu-lookahead", type=int, default=0)
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="no_prefix,native_prefix,explicit_blend",
+        help=(
+            "Comma-separated methods to run. Choices: "
+            "no_prefix,native_prefix,explicit_blend."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Build and summarize the workload only, without launching any "
+            "model runtime."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -293,6 +321,27 @@ def build_sampling_params(max_tokens: int) -> SamplingParams:
         max_tokens=max_tokens,
         ignore_eos=True,
     )
+
+
+def parse_methods(raw: str) -> list[str]:
+    methods = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if not methods:
+        raise ValueError("methods cannot be empty.")
+
+    invalid = [item for item in methods if item not in METHOD_CHOICES]
+    if invalid:
+        raise ValueError(
+            f"Unsupported methods={invalid!r}; expected choices={METHOD_CHOICES!r}"
+        )
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for method in methods:
+        if method in seen:
+            continue
+        seen.add(method)
+        ordered.append(method)
+    return ordered
 
 
 def build_utility_cfg(args: argparse.Namespace) -> OnlineUtilityPlannerConfig:
@@ -965,41 +1014,127 @@ def print_maintenance_summary(name: str, summary: MaintenanceSummary) -> None:
     )
 
 
+def print_dry_run_summary(
+    *,
+    out_dir: Path,
+    args: argparse.Namespace,
+    methods: list[str],
+    workload: dict[str, Any],
+) -> None:
+    stats = workload["stats"]
+    prefill_records = list(workload["prefill_records"])
+    unique_chunks = workload["unique_chunks"]
+    prefill_plan = workload.get("prefill_plan") or {}
+
+    plan_counts: dict[str, int] = {}
+    for record in prefill_records:
+        location = str(getattr(record, "store_location", None) or "drop")
+        plan_counts[location] = int(plan_counts.get(location, 0) + 1)
+
+    summary = {
+        "workload_kind": str(args.workload_kind),
+        "datasets": list(workload["datasets"]),
+        "methods": list(methods),
+        "query_count": int(stats.query_count),
+        "unique_fragments": int(stats.unique_fragments),
+        "mean_prompt_tokens": float(stats.mean_prompt_tokens),
+        "p90_prompt_tokens": float(stats.p90_prompt_tokens),
+        "max_prompt_tokens": int(stats.max_prompt_tokens),
+        "mean_memory_prefix_tokens": float(stats.mean_memory_prefix_tokens),
+        "p90_memory_prefix_tokens": float(stats.p90_memory_prefix_tokens),
+        "max_memory_prefix_tokens": int(stats.max_memory_prefix_tokens),
+        "prefill_record_count": len(prefill_records),
+        "prefill_plan_counts": plan_counts,
+        "prefill_plan_summary": summarize_prefill_plan(
+            unique_chunks=unique_chunks,
+            prefill_plan=prefill_plan,
+        ),
+        "out_dir": str(out_dir),
+    }
+
+    output_path = out_dir / "dry_run_summary.json"
+    output_path.write_text(
+        json.dumps(summary, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    print("dry_run: true")
+    print(f"workload_kind: {summary['workload_kind']}")
+    print(f"datasets: {','.join(summary['datasets'])}")
+    print(f"methods: {','.join(summary['methods'])}")
+    print(
+        "workload: "
+        f"queries={summary['query_count']} "
+        f"unique_fragments={summary['unique_fragments']} "
+        f"mean_prompt_tokens={summary['mean_prompt_tokens']:.1f} "
+        f"p90_prompt_tokens={summary['p90_prompt_tokens']:.1f} "
+        f"max_prompt_tokens={summary['max_prompt_tokens']}"
+    )
+    print(
+        "memory_prefix: "
+        f"mean={summary['mean_memory_prefix_tokens']:.1f} "
+        f"p90={summary['p90_memory_prefix_tokens']:.1f} "
+        f"max={summary['max_memory_prefix_tokens']}"
+    )
+    print(
+        "prefill: "
+        f"records={summary['prefill_record_count']} "
+        f"placement_counts={summary['prefill_plan_counts']}"
+    )
+    print(f"dry_run_json: {output_path}")
+
+
 def main() -> None:
     args = parse_args()
     out_dir = ensure_out_dir(args)
+    methods = parse_methods(str(args.methods))
     sampling_params = build_sampling_params(int(args.max_tokens))
     runtime_env = {"CUDA_VISIBLE_DEVICES": str(args.cuda_visible_devices)}
 
     with blend_cpu_bench_module().temporary_environ(runtime_env):
         workload = build_workload_for_probe(args)
-        no_prefix_measurements, no_prefix = run_plain_workload(
-            args=args,
-            warmup_prompt_ids=list(workload["warmup_prompt_ids"]),
-            query_records=list(workload["query_records"]),
-            sampling_params=sampling_params,
-            enable_prefix_caching=False,
-        )
-        del no_prefix_measurements
-        safe_release_cuda_memory()
+        if bool(args.dry_run):
+            print_dry_run_summary(
+                out_dir=out_dir,
+                args=args,
+                methods=methods,
+                workload=workload,
+            )
+            return
+        no_prefix: LatencySummary | None = None
+        native_prefix: LatencySummary | None = None
+        explicit_blend: ExplicitBlendSummary | None = None
 
-        native_prefix_measurements, native_prefix = run_plain_workload(
-            args=args,
-            warmup_prompt_ids=list(workload["warmup_prompt_ids"]),
-            query_records=list(workload["query_records"]),
-            sampling_params=sampling_params,
-            enable_prefix_caching=True,
-        )
-        del native_prefix_measurements
-        safe_release_cuda_memory()
+        if "no_prefix" in methods:
+            no_prefix_measurements, no_prefix = run_plain_workload(
+                args=args,
+                warmup_prompt_ids=list(workload["warmup_prompt_ids"]),
+                query_records=list(workload["query_records"]),
+                sampling_params=sampling_params,
+                enable_prefix_caching=False,
+            )
+            del no_prefix_measurements
+            safe_release_cuda_memory()
 
-        explicit_blend = run_explicit_blend(
-            args=args,
-            out_dir=out_dir,
-            workload=workload,
-            sampling_params=sampling_params,
-        )
-        safe_release_cuda_memory()
+        if "native_prefix" in methods:
+            native_prefix_measurements, native_prefix = run_plain_workload(
+                args=args,
+                warmup_prompt_ids=list(workload["warmup_prompt_ids"]),
+                query_records=list(workload["query_records"]),
+                sampling_params=sampling_params,
+                enable_prefix_caching=True,
+            )
+            del native_prefix_measurements
+            safe_release_cuda_memory()
+
+        if "explicit_blend" in methods:
+            explicit_blend = run_explicit_blend(
+                args=args,
+                out_dir=out_dir,
+                workload=workload,
+                sampling_params=sampling_params,
+            )
+            safe_release_cuda_memory()
 
     result = BenchmarkResult(
         model=str(args.model),
@@ -1019,40 +1154,43 @@ def main() -> None:
     )
 
     print(f"out_dir: {out_dir}")
-    print_latency_summary("no_prefix", no_prefix)
-    print_latency_summary("native_prefix", native_prefix)
-    print_latency_summary("explicit_blend_online", explicit_blend.online)
-    print(
-        "explicit_blend_mode: "
-        f"fragment_management_policy={explicit_blend.fragment_management_policy} "
-        f"online_execution_policy={explicit_blend.online_execution_policy} "
-        f"online_execution_mode={explicit_blend.online_execution_mode} "
-        f"blend_engine_prefix_caching={explicit_blend.blend_engine_prefix_caching}"
-    )
-    print(
-        "explicit_blend_utility: "
-        f"semantic_hints={explicit_blend.utility_enable_semantic_hints} "
-        f"recompute_requests={explicit_blend.utility_mode_recompute_requests} "
-        f"blend_requests={explicit_blend.utility_mode_blend_requests} "
-        f"mean_pred_recompute_ms={explicit_blend.mean_predicted_recompute_utility_ms:.3f} "
-        f"mean_pred_blend_ms={explicit_blend.mean_predicted_cacheblend_utility_ms:.3f} "
-        f"mean_gap_ms={explicit_blend.mean_predicted_decision_gap_ms:.3f}"
-    )
-    print_maintenance_summary(
-        "explicit_blend_initial_materialization",
-        explicit_blend.initial_materialization,
-    )
-    print_maintenance_summary(
-        "explicit_blend_inter_query_maintenance",
-        explicit_blend.maintenance,
-    )
-    print(
-        "explicit_blend_shadow: "
-        f"mean_hit_tokens={explicit_blend.mean_shadow_hit_tokens:.1f} "
-        f"mean_gpu_hit_tokens={explicit_blend.mean_shadow_gpu_hit_tokens:.1f} "
-        f"mean_cpu_hit_tokens={explicit_blend.mean_shadow_cpu_hit_tokens:.1f} "
-        f"mean_miss_tokens={explicit_blend.mean_shadow_miss_tokens:.1f}"
-    )
+    if no_prefix is not None:
+        print_latency_summary("no_prefix", no_prefix)
+    if native_prefix is not None:
+        print_latency_summary("native_prefix", native_prefix)
+    if explicit_blend is not None:
+        print_latency_summary("explicit_blend_online", explicit_blend.online)
+        print(
+            "explicit_blend_mode: "
+            f"fragment_management_policy={explicit_blend.fragment_management_policy} "
+            f"online_execution_policy={explicit_blend.online_execution_policy} "
+            f"online_execution_mode={explicit_blend.online_execution_mode} "
+            f"blend_engine_prefix_caching={explicit_blend.blend_engine_prefix_caching}"
+        )
+        print(
+            "explicit_blend_utility: "
+            f"semantic_hints={explicit_blend.utility_enable_semantic_hints} "
+            f"recompute_requests={explicit_blend.utility_mode_recompute_requests} "
+            f"blend_requests={explicit_blend.utility_mode_blend_requests} "
+            f"mean_pred_recompute_ms={explicit_blend.mean_predicted_recompute_utility_ms:.3f} "
+            f"mean_pred_blend_ms={explicit_blend.mean_predicted_cacheblend_utility_ms:.3f} "
+            f"mean_gap_ms={explicit_blend.mean_predicted_decision_gap_ms:.3f}"
+        )
+        print_maintenance_summary(
+            "explicit_blend_initial_materialization",
+            explicit_blend.initial_materialization,
+        )
+        print_maintenance_summary(
+            "explicit_blend_inter_query_maintenance",
+            explicit_blend.maintenance,
+        )
+        print(
+            "explicit_blend_shadow: "
+            f"mean_hit_tokens={explicit_blend.mean_shadow_hit_tokens:.1f} "
+            f"mean_gpu_hit_tokens={explicit_blend.mean_shadow_gpu_hit_tokens:.1f} "
+            f"mean_cpu_hit_tokens={explicit_blend.mean_shadow_cpu_hit_tokens:.1f} "
+            f"mean_miss_tokens={explicit_blend.mean_shadow_miss_tokens:.1f}"
+        )
     print(f"result_json: {output_path}")
 
 

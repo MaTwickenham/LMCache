@@ -401,6 +401,8 @@ class ExplicitFragmentPool:
         self.query_index = 0
         self.access_counts: dict[str, int] = {}
         self.last_access_query_idx: dict[str, int] = {}
+        self._utility_cache_query_index: int | None = None
+        self._utility_cache: dict[str, FragmentTierUtility] = {}
 
     def _utility_policy_enabled(self) -> bool:
         return (
@@ -480,13 +482,25 @@ class ExplicitFragmentPool:
             return None
         return max(self.query_index - int(last_seen), 0)
 
+    def _invalidate_utility_cache(self) -> None:
+        self._utility_cache_query_index = None
+        self._utility_cache.clear()
+
     def _chunk_utility(self, chunk_id: str) -> FragmentTierUtility:
         cfg = self.maintenance_cfg
         if cfg is None:
             raise RuntimeError("Chunk utility requested without maintenance config.")
 
+        if self._utility_cache_query_index != self.query_index:
+            self._utility_cache_query_index = int(self.query_index)
+            self._utility_cache.clear()
+
+        cached = self._utility_cache.get(chunk_id)
+        if cached is not None:
+            return cached
+
         meta = self._fragment_meta(chunk_id)
-        return estimate_fragment_tier_utilities(
+        utility = estimate_fragment_tier_utilities(
             layer=str(meta.get("layer", "unknown")),
             kind=str(meta.get("type") or meta.get("memory_type") or ""),
             tokens=int(self.fragment_tokens.get(chunk_id, 0) or 0),
@@ -494,8 +508,11 @@ class ExplicitFragmentPool:
             cfg=cfg,
             access_count=int(self.access_counts.get(chunk_id, 0) or 0),
             queries_since_access=self._queries_since_access(chunk_id),
+            current_query_idx=int(self.query_index),
             has_cpu_fallback=self.cpu_enabled,
         )
+        self._utility_cache[chunk_id] = utility
+        return utility
 
     def _value_density(self, chunk_id: str, value: float) -> float:
         tokens = max(int(self.fragment_tokens.get(chunk_id, 0) or 0), 1)
@@ -932,6 +949,7 @@ class ExplicitFragmentPool:
         )
 
     def note_query_access(self, chunk_ids: list[str]) -> None:
+        self._invalidate_utility_cache()
         for chunk_id in chunk_ids:
             self.access_counts[chunk_id] = int(self.access_counts.get(chunk_id, 0)) + 1
             self.last_access_query_idx[chunk_id] = int(self.query_index)

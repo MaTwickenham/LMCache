@@ -35,7 +35,10 @@ from compare_prefix_vs_blend_memoryos_server import QueryRecord
 def build_workload_for_probe(args: Any) -> dict[str, Any]:
     data_root = Path(args.data_root)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    datasets = resolve_datasets(args.workload_kind, "")
+    datasets = resolve_datasets(
+        args.workload_kind,
+        str(getattr(args, "datasets", "") or ""),
+    )
     fragment_order_policy = resolve_fragment_order_policy(
         workload_kind=args.workload_kind,
         raw_policy=args.fragment_order_policy,
@@ -74,7 +77,13 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
             traces = traces[: args.max_qa_per_dataset]
 
         memory_index = None
-        if args.workload_kind in ("amem", "memos", "skillsbench"):
+        if args.workload_kind in (
+            "amem",
+            "memos",
+            "skillsbench",
+            "dspy_locomo",
+            "memgas",
+        ):
             memory_index = load_memory_index(
                 data_root=data_root,
                 workload_kind=args.workload_kind,

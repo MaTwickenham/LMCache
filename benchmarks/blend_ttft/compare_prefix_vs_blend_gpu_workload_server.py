@@ -14,6 +14,8 @@ The script supports processed workload formats under
 - `amem`
 - `memos`
 - `skillsbench`
+- `dspy_locomo`
+- `memgas`
 
 For the Blend path, the offline fragment prefill stage stores reusable
 fragment KV in the LMCache GPU backend. Online TTFT is measured from request
@@ -70,7 +72,14 @@ from utility_guided_prefill import (
 )
 
 
-WORKLOAD_KIND_CHOICES = ("memoryos", "amem", "memos", "skillsbench")
+WORKLOAD_KIND_CHOICES = (
+    "memoryos",
+    "amem",
+    "memos",
+    "skillsbench",
+    "dspy_locomo",
+    "memgas",
+)
 PROMPT_LAYOUT_CHOICES = ("memory_first", "question_first")
 FRAGMENT_ORDER_POLICY_CHOICES = (
     "auto",
@@ -86,6 +95,8 @@ DEFAULT_DATASETS_BY_WORKLOAD = {
     "amem": ["conv26", "conv30", "conv41"],
     "memos": ["locomo_conv0", "locomo_conv1", "locomo_conv2"],
     "skillsbench": ["dense_core"],
+    "dspy_locomo": ["conv-26", "conv-30", "conv-41"],
+    "memgas": ["locomo10_minilm"],
 }
 
 
@@ -159,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         choices=list(FRAGMENT_ORDER_POLICY_CHOICES),
         help=(
             "'auto' resolves to 'profile_last' for memoryos and 'trace' for "
-            "amem/memos."
+            "amem/memos/memgas."
         ),
     )
     parser.add_argument(
@@ -499,7 +510,13 @@ def build_workload(
             traces = traces[:max_qa_per_dataset]
 
         memory_index = None
-        if workload_kind in ("amem", "memos", "skillsbench"):
+        if workload_kind in (
+            "amem",
+            "memos",
+            "skillsbench",
+            "dspy_locomo",
+            "memgas",
+        ):
             memory_index = load_memory_index(
                 data_root=data_root,
                 workload_kind=workload_kind,
@@ -778,6 +795,32 @@ def load_trace(
         trace_path = data_root / "memos" / f"memos_{dataset}_qa_trace.json"
     elif workload_kind == "skillsbench":
         trace_path = data_root / "skillsbench" / f"skillsbench_{dataset}_queries.jsonl"
+    elif workload_kind == "dspy_locomo":
+        loaded = []
+        for row in load_dspy_locomo_rows(data_root=data_root, dataset=dataset):
+            query = row.get("query") or {}
+            final_context_units = ordered_dspy_locomo_units(row)
+            loaded.append(
+                {
+                    "query_id": str(
+                        row.get("trace_id")
+                        or f"dspy_locomo:{dataset}:{row.get('qa_index', len(loaded))}"
+                    ),
+                    "question": str(query.get("raw_query", "") or ""),
+                    "retrieved_memories": [
+                        str(unit.get("unit_id", "")).strip()
+                        for unit in final_context_units
+                        if str(unit.get("unit_id", "")).strip()
+                    ],
+                    "sample_id": str(row.get("sample_id", "") or dataset),
+                    "qa_index": int(row.get("qa_index", len(loaded)) or len(loaded)),
+                    "trace_id": str(row.get("trace_id", "") or ""),
+                    "category": query.get("category"),
+                }
+            )
+        return loaded
+    elif workload_kind == "memgas":
+        trace_path = data_root / "memgas" / f"memgas_{dataset}_qa_trace.json"
     else:
         raise ValueError(f"Unsupported workload_kind={workload_kind!r}")
 
@@ -809,6 +852,66 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def normalize_dspy_locomo_dataset_name(dataset: str) -> str:
+    raw = str(dataset or "").strip()
+    if raw.startswith("conv") and "-" not in raw:
+        suffix = raw[4:]
+        if suffix.isdigit():
+            return f"conv-{suffix}"
+    return raw
+
+
+def dspy_locomo_trace_path(data_root: Path) -> Path:
+    base = data_root / "dspy_locomo"
+    candidates = (
+        "locomo_q500_grouped_clustered_dspy_trace.jsonl",
+        "locomo_q500_grouped_clustered_rich_trace_with_llm_answer.jsonl",
+    )
+    for filename in candidates:
+        path = base / filename
+        if path.exists():
+            return path
+    return base / candidates[0]
+
+
+def load_dspy_locomo_rows(
+    *,
+    data_root: Path,
+    dataset: str,
+) -> list[dict[str, Any]]:
+    trace_path = dspy_locomo_trace_path(data_root)
+    if not trace_path.exists():
+        raise FileNotFoundError(f"Dataset trace not found: {trace_path}")
+
+    target_dataset = normalize_dspy_locomo_dataset_name(dataset)
+    rows = [
+        row
+        for row in load_jsonl(trace_path)
+        if str(row.get("sample_id", "")).strip() == target_dataset
+    ]
+    if not rows:
+        raise FileNotFoundError(
+            "No dspy_locomo traces found for dataset="
+            f"{target_dataset!r} in {trace_path}"
+        )
+    return rows
+
+
+def ordered_dspy_locomo_units(trace_row: dict[str, Any]) -> list[dict[str, Any]]:
+    units = list((trace_row.get("assembly") or {}).get("final_context_units") or [])
+
+    def sort_key(unit: dict[str, Any]) -> tuple[int, str]:
+        try:
+            order = int(unit.get("order", 1 << 30) or (1 << 30))
+        except Exception:
+            order = 1 << 30
+        unit_id = str(unit.get("unit_id", "") or "")
+        return order, unit_id
+
+    units.sort(key=sort_key)
+    return units
+
+
 def load_memory_index(
     *,
     data_root: Path,
@@ -821,8 +924,62 @@ def load_memory_index(
         memory_path = data_root / "memos" / f"memos_{dataset}_memorys.json"
     elif workload_kind == "skillsbench":
         memory_path = data_root / "skillsbench" / f"skillsbench_{dataset}_fragments.jsonl"
+    elif workload_kind == "dspy_locomo":
+        loaded = []
+        for row in load_dspy_locomo_rows(data_root=data_root, dataset=dataset):
+            for unit in ordered_dspy_locomo_units(row):
+                memory_id = str(unit.get("unit_id", "")).strip()
+                text = str(unit.get("text", "")).strip()
+                if not memory_id or not text:
+                    continue
+                hint = unit.get("hint") or {}
+                unit_type = str(
+                    unit.get("unit_type")
+                    or hint.get("block_type")
+                    or "retrieved_unit"
+                ).strip()
+                loaded.append(
+                    {
+                        "memory_id": memory_id,
+                        "content": text,
+                        "tokens": int(unit.get("token_len", 0) or 0),
+                        "meta": {
+                            "memory_type": unit_type,
+                            "type": unit_type,
+                            "hint_role": str(hint.get("hint_role", "") or "").strip(),
+                            "hint_importance": hint.get("hint_importance"),
+                            "temporal_index": hint.get("temporal_index"),
+                            "source_session_id": (
+                                hint.get("source_session_id") or unit.get("session_id")
+                            ),
+                            "speaker_set": list(hint.get("speaker_set") or []),
+                            "source_turn_ids": list(
+                                hint.get("source_turn_ids")
+                                or unit.get("source_turn_ids")
+                                or []
+                            ),
+                            "content_hash": str(
+                                unit.get("content_hash", "") or ""
+                            ).strip(),
+                        },
+                        "sample_id": str(row.get("sample_id", "") or dataset),
+                    }
+                )
+    elif workload_kind == "memgas":
+        memory_path = data_root / "memgas" / f"memgas_{dataset}_memorys.json"
     else:
         raise ValueError(f"Unsupported workload_kind={workload_kind!r}")
+
+    if workload_kind == "dspy_locomo":
+        index: dict[str, dict[str, Any]] = {}
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            memory_id = str(item.get("memory_id", "")).strip()
+            if not memory_id:
+                continue
+            index[memory_id] = item
+        return index
 
     if not memory_path.exists():
         raise FileNotFoundError(f"Dataset memory file not found: {memory_path}")
@@ -1034,6 +1191,14 @@ def extract_skillsbench_chunks(
                 "task_frequency": int(fragment_record.get("task_count", 0) or 0),
                 "skill_names": list(fragment_record.get("skill_names") or []),
                 "source_tasks": list(fragment_record.get("source_tasks") or []),
+                "attachment_role": str(fragment_record.get("dominant_role", "") or ""),
+                "role_counts": dict(fragment_record.get("role_counts") or {}),
+                "semantic_groups": list(fragment_record.get("semantic_groups") or []),
+                "group_frequency": int(
+                    fragment_record.get("group_frequency", 0)
+                    or fragment_record.get("task_count", 0)
+                    or 0
+                ),
             }
         chunk_ids.append(chunk_id)
     return chunk_ids
@@ -1085,10 +1250,18 @@ def resolve_sample_id(
         return str(qa_trace.get("sample_id", f"{dataset}:{qa_index}"))
     if workload_kind == "memos":
         return str(qa_trace.get("query_id", f"{dataset}:{qa_index}"))
+    if workload_kind == "memgas":
+        return str(qa_trace.get("query_id", f"{dataset}:{qa_index}"))
     if workload_kind == "skillsbench":
         return str(
             qa_trace.get("query_id")
             or qa_trace.get("task_id")
+            or f"{dataset}:{qa_index}"
+        )
+    if workload_kind == "dspy_locomo":
+        return str(
+            qa_trace.get("query_id")
+            or qa_trace.get("trace_id")
             or f"{dataset}:{qa_index}"
         )
     return f"{workload_kind}:{dataset}:{qa_index}"
