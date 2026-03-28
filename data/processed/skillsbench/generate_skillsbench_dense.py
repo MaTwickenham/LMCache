@@ -20,6 +20,22 @@ SCRIPT_SUFFIXES = {".js", ".md", ".py", ".sh", ".txt"}
 REFERENCE_SUFFIXES = {".csv", ".json", ".md", ".toml", ".txt", ".yaml", ".yml"}
 DIRECT_REFERENCE_FILES = {"reference.md", "forms.md", "html2pptx.md", "ooxml.md", "docx-js.md"}
 CORE_EXCLUDED_TASKS = {"pedestrian-traffic-counting"}
+ANCHOR_SKILL_NAME = "request_anchor"
+ANCHOR_RELATIVE_PATH = "generated/request_brief.md"
+ANCHOR_FOCUS_LINES = (
+    "adapt reusable skills to the current request",
+    "validate edge cases before producing the final answer",
+    "prioritize output formatting and completion checks",
+    "cross-check constraints against the attached skill manuals",
+    "compress shared procedures into a concise execution plan",
+    "focus on failure recovery and fallback handling",
+)
+ANCHOR_REVIEW_LINES = (
+    "surface the most task-specific constraints first",
+    "keep broad support material behind the request brief",
+    "treat the downstream skill context as reusable support",
+    "separate ephemeral request state from reusable memory",
+)
 
 
 @dataclass(frozen=True)
@@ -121,6 +137,305 @@ def load_task_metadata(task_dir: Path) -> dict[str, Any]:
         loaded = tomllib.loads(task_toml.read_text(encoding="utf-8"))
         metadata = loaded.get("metadata") or {}
     return metadata
+
+
+def stable_int(value: str) -> int:
+    return int(hashlib.sha256(value.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def slugify_label(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    cleaned = [
+        char if char.isalnum() else "_"
+        for char in raw
+    ]
+    label = "".join(cleaned).strip("_")
+    while "__" in label:
+        label = label.replace("__", "_")
+    return label or "unknown"
+
+
+def role_priority(role: str) -> int:
+    return {
+        "core_support": 3,
+        "primary": 2,
+        "secondary_support": 1,
+    }.get(role, 0)
+
+
+def choose_dominant_role(role_counts: Counter[str]) -> str:
+    if not role_counts:
+        return "primary"
+    return max(
+        role_counts.items(),
+        key=lambda item: (item[1], role_priority(item[0]), item[0]),
+    )[0]
+
+
+def infer_attachment_role(
+    *,
+    component_size: int,
+    fragment_task_count: int,
+    skill_task_count: int,
+) -> str:
+    share_count = max(int(fragment_task_count), int(skill_task_count))
+    if share_count <= 1:
+        return "primary"
+    if component_size <= 0:
+        return "secondary_support"
+    share_ratio = float(share_count) / float(component_size)
+    if share_ratio >= 0.5 or share_count >= 4:
+        return "core_support"
+    return "secondary_support"
+
+
+def infer_attachment_reason(role: str) -> str:
+    if role == "core_support":
+        return "widely reused support skill shared across related tasks"
+    if role == "secondary_support":
+        return "partially shared helper skill reused across a subset of tasks"
+    return "task-specific instruction or narrow skill tied to the current request"
+
+
+def build_component_lookup(
+    *,
+    components: list[list[str]],
+    all_tasks: list[str],
+) -> tuple[dict[str, int], dict[int, set[str]]]:
+    task_to_component = {task_id: -1 for task_id in all_tasks}
+    component_members: dict[int, set[str]] = {}
+    for component_id, component_tasks in enumerate(components):
+        members = set(component_tasks)
+        component_members[component_id] = members
+        for task_id in component_tasks:
+            task_to_component[task_id] = component_id
+    return task_to_component, component_members
+
+
+def annotate_fragment_semantics(
+    *,
+    tasks: dict[str, dict[str, Any]],
+    task_files: dict[str, list[SourceFile]],
+    fragments: dict[str, dict[str, Any]],
+    components: list[list[str]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    all_tasks = sorted(tasks)
+    task_to_component, component_members = build_component_lookup(
+        components=components,
+        all_tasks=all_tasks,
+    )
+    skill_tasks_by_component: dict[tuple[int, str], set[str]] = defaultdict(set)
+    for task_id, files in task_files.items():
+        component_id = task_to_component.get(task_id, -1)
+        for source_file in files:
+            skill_tasks_by_component[(component_id, source_file.skill_name)].add(task_id)
+
+    for fragment in fragments.values():
+        fragment["semantic_groups"] = set(fragment.get("semantic_groups") or [])
+        fragment["role_counts"] = Counter(fragment.get("role_counts") or {})
+        fragment["primary_task_ids"] = set(fragment.get("primary_task_ids") or [])
+        fragment["core_support_task_ids"] = set(fragment.get("core_support_task_ids") or [])
+        fragment["secondary_task_ids"] = set(fragment.get("secondary_task_ids") or [])
+        fragment["group_frequency"] = int(fragment.get("task_count", 1) or 1)
+
+    task_fragment_meta: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for task_id in all_tasks:
+        component_id = task_to_component.get(task_id, -1)
+        component_size = len(component_members.get(component_id, {task_id}))
+        seen_fragment_ids: set[str] = set()
+        for source_file in task_files.get(task_id, []):
+            fragment_id = source_file.fragment_id
+            if fragment_id in seen_fragment_ids:
+                continue
+            seen_fragment_ids.add(fragment_id)
+
+            fragment = fragments[fragment_id]
+            fragment_task_count = sum(
+                1
+                for candidate_task in fragment["source_tasks"]
+                if task_to_component.get(candidate_task, -1) == component_id
+            )
+            fragment_task_count = max(fragment_task_count, 1)
+            skill_task_count = max(
+                len(skill_tasks_by_component[(component_id, source_file.skill_name)]),
+                1,
+            )
+            group_frequency = max(fragment_task_count, skill_task_count)
+            role = infer_attachment_role(
+                component_size=component_size,
+                fragment_task_count=fragment_task_count,
+                skill_task_count=skill_task_count,
+            )
+            reason = infer_attachment_reason(role)
+            semantic_groups = {
+                f"component::{component_id if component_id >= 0 else 'isolated'}",
+                f"skill::{slugify_label(source_file.skill_name)}",
+            }
+            category = tasks[task_id].get("category")
+            if category:
+                semantic_groups.add(f"category::{slugify_label(category)}")
+
+            task_fragment_meta[task_id][fragment_id] = {
+                "skill_name": source_file.skill_name,
+                "relative_path": source_file.relative_path,
+                "attachment_role": role,
+                "attachment_reason": reason,
+                "group_frequency": int(group_frequency),
+                "semantic_groups": sorted(semantic_groups),
+            }
+
+            for source_record in fragment["source_files"]:
+                if (
+                    source_record["task_id"] == task_id
+                    and source_record["skill_name"] == source_file.skill_name
+                    and source_record["relative_path"] == source_file.relative_path
+                ):
+                    source_record["attachment_role"] = role
+                    source_record["attachment_reason"] = reason
+                    source_record["group_frequency"] = int(group_frequency)
+                    source_record["semantic_groups"] = sorted(semantic_groups)
+
+            fragment["semantic_groups"].update(semantic_groups)
+            fragment["role_counts"][role] += 1
+            fragment["group_frequency"] = max(
+                int(fragment["group_frequency"]),
+                int(group_frequency),
+            )
+            if role == "primary":
+                fragment["primary_task_ids"].add(task_id)
+            elif role == "core_support":
+                fragment["core_support_task_ids"].add(task_id)
+            elif role == "secondary_support":
+                fragment["secondary_task_ids"].add(task_id)
+
+    for fragment in fragments.values():
+        role_counts = Counter(fragment["role_counts"])
+        fragment["semantic_groups"] = sorted(fragment["semantic_groups"])
+        fragment["usage_roles"] = sorted(role_counts)
+        fragment["dominant_role"] = choose_dominant_role(role_counts)
+        fragment["role_counts"] = dict(sorted(role_counts.items()))
+        fragment["group_frequency"] = max(
+            int(fragment.get("group_frequency", fragment["task_count"]) or fragment["task_count"]),
+            int(fragment["task_count"]),
+        )
+        fragment["primary_task_ids"] = sorted(fragment["primary_task_ids"])
+        fragment["core_support_task_ids"] = sorted(fragment["core_support_task_ids"])
+        fragment["secondary_task_ids"] = sorted(fragment["secondary_task_ids"])
+
+    return {
+        task_id: dict(fragment_meta)
+        for task_id, fragment_meta in task_fragment_meta.items()
+    }
+
+
+def ordered_semantic_fragment_items(
+    *,
+    task_id: str,
+    task_files: dict[str, list[SourceFile]],
+    task_fragment_meta: dict[str, dict[str, dict[str, Any]]],
+) -> list[tuple[SourceFile, dict[str, Any]]]:
+    seen_fragment_ids: set[str] = set()
+    items: list[tuple[SourceFile, dict[str, Any], int]] = []
+    for source_index, source_file in enumerate(task_files[task_id]):
+        fragment_id = source_file.fragment_id
+        if fragment_id in seen_fragment_ids:
+            continue
+        seen_fragment_ids.add(fragment_id)
+        meta = dict(task_fragment_meta.get(task_id, {}).get(fragment_id) or {})
+        items.append((source_file, meta, source_index))
+
+    items.sort(
+        key=lambda item: (
+            {
+                "primary": 0,
+                "core_support": 1,
+                "secondary_support": 2,
+            }.get(str(item[1].get("attachment_role") or ""), 3),
+            -int(item[1].get("group_frequency", 1) or 1),
+            item[2],
+            item[0].fragment_id,
+        )
+    )
+    return [(source_file, meta) for source_file, meta, _ in items]
+
+
+def build_request_anchor_fragment(
+    *,
+    task_id: str,
+    task_meta: dict[str, Any],
+    ordered_skill_names: list[str],
+    semantic_groups: list[str],
+    occurrence_tag: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    focus_seed = stable_int(f"{task_id}::{occurrence_tag}")
+    focus_line = ANCHOR_FOCUS_LINES[focus_seed % len(ANCHOR_FOCUS_LINES)]
+    review_line = ANCHOR_REVIEW_LINES[(focus_seed // len(ANCHOR_FOCUS_LINES)) % len(ANCHOR_REVIEW_LINES)]
+    instruction = " ".join(str(task_meta.get("instruction") or "").split())
+    instruction = instruction[:280]
+    skill_preview = ", ".join(ordered_skill_names[:4]) if ordered_skill_names else "general_support"
+    anchor_text = "\n".join(
+        [
+            "Request Brief",
+            f"Instance: {occurrence_tag}",
+            f"Task: {task_id}",
+            f"Category: {task_meta.get('category') or 'unknown'}",
+            f"Difficulty: {task_meta.get('difficulty') or 'unknown'}",
+            f"Immediate focus: {focus_line}.",
+            f"Review rule: {review_line}.",
+            f"Reusable skills to consult: {skill_preview}",
+            f"Current request: {instruction}",
+        ]
+    )
+    anchor_bytes = anchor_text.encode("utf-8")
+    fragment_id = f"skillsbench:anchor:{sha256_hex(anchor_bytes)[:16]}"
+    fragment_row = {
+        "fragment_id": fragment_id,
+        "sha256": sha256_hex(anchor_bytes),
+        "kind": "task_brief",
+        "size_bytes": len(anchor_bytes),
+        "size_chars": len(anchor_text),
+        "line_count": anchor_text.count("\n") + 1,
+        "task_count": 1,
+        "source_file_count": 1,
+        "source_tasks": [task_id],
+        "skill_names": [ANCHOR_SKILL_NAME],
+        "source_files": [
+            {
+                "task_id": task_id,
+                "skill_name": ANCHOR_SKILL_NAME,
+                "relative_path": ANCHOR_RELATIVE_PATH,
+                "source_path": f"synthetic://skillsbench/{task_id}/{occurrence_tag}",
+                "attachment_role": "primary",
+                "attachment_reason": "query-specific working context that should not be reused across requests",
+                "group_frequency": 1,
+                "semantic_groups": sorted(set(semantic_groups) | {"ephemeral_request"}),
+            }
+        ],
+        "usage_roles": ["primary"],
+        "role_counts": {"primary": 1},
+        "dominant_role": "primary",
+        "semantic_groups": sorted(set(semantic_groups) | {"ephemeral_request"}),
+        "group_frequency": 1,
+        "primary_task_ids": [task_id],
+        "core_support_task_ids": [],
+        "secondary_task_ids": [],
+        "text": anchor_text,
+    }
+    query_fragment = {
+        "position": 0,
+        "fragment_id": fragment_id,
+        "kind": "task_brief",
+        "skill_name": ANCHOR_SKILL_NAME,
+        "relative_path": ANCHOR_RELATIVE_PATH,
+        "size_bytes": len(anchor_bytes),
+        "size_chars": len(anchor_text),
+        "task_frequency": 1,
+        "group_frequency": 1,
+        "attachment_role": "primary",
+        "attachment_reason": "query-specific working context that separates ephemeral intent from reusable skill memory",
+        "semantic_groups": sorted(set(semantic_groups) | {"ephemeral_request"}),
+    }
+    return fragment_row, query_fragment
 
 
 def build_task_inventory(source_root: Path) -> tuple[
@@ -377,28 +692,67 @@ def build_query_rows(
     tasks: dict[str, dict[str, Any]],
     task_files: dict[str, list[SourceFile]],
     fragments: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
+    task_fragment_meta: dict[str, dict[str, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
+    anchor_fragments: dict[str, dict[str, Any]] = {}
     for task_id in task_ids:
-        fragment_ids = ordered_unique_fragment_ids(task_files[task_id])
-        per_fragment = []
-        query_bytes = 0
-        for position, fragment_id in enumerate(fragment_ids):
+        fragment_items = ordered_semantic_fragment_items(
+            task_id=task_id,
+            task_files=task_files,
+            task_fragment_meta=task_fragment_meta,
+        )
+        base_skills = [
+            str(meta.get("skill_name") or source_file.skill_name)
+            for source_file, meta in fragment_items
+        ]
+        semantic_groups = sorted(
+            {
+                group
+                for _source_file, meta in fragment_items
+                for group in meta.get("semantic_groups") or []
+            }
+        )
+        anchor_row, anchor_query_fragment = build_request_anchor_fragment(
+            task_id=task_id,
+            task_meta=tasks[task_id],
+            ordered_skill_names=list(dict.fromkeys(base_skills)),
+            semantic_groups=semantic_groups,
+            occurrence_tag=variant_name,
+        )
+        anchor_fragments[anchor_row["fragment_id"]] = anchor_row
+
+        fragment_ids = [anchor_row["fragment_id"]]
+        per_fragment = [anchor_query_fragment]
+        query_bytes = int(anchor_row["size_bytes"])
+        for position, (source_match, meta) in enumerate(fragment_items, start=1):
+            fragment_id = source_match.fragment_id
             fragment = fragments[fragment_id]
-            source_match = next(
-                source_file for source_file in task_files[task_id] if source_file.fragment_id == fragment_id
-            )
+            fragment_ids.append(fragment_id)
             query_bytes += fragment["size_bytes"]
             per_fragment.append(
                 {
                     "position": position,
                     "fragment_id": fragment_id,
                     "kind": fragment["kind"],
-                    "skill_name": source_match.skill_name,
-                    "relative_path": source_match.relative_path,
+                    "skill_name": str(meta.get("skill_name") or source_match.skill_name),
+                    "relative_path": str(meta.get("relative_path") or source_match.relative_path),
                     "size_bytes": fragment["size_bytes"],
                     "size_chars": fragment["size_chars"],
                     "task_frequency": fragment["task_count"],
+                    "group_frequency": int(
+                        meta.get("group_frequency", fragment.get("group_frequency", fragment["task_count"]))
+                    ),
+                    "attachment_role": str(meta.get("attachment_role") or fragment.get("dominant_role") or "primary"),
+                    "attachment_reason": str(
+                        meta.get("attachment_reason")
+                        or "semantic role inferred from task-local and component-level reuse"
+                    ),
+                    "semantic_groups": list(
+                        meta.get("semantic_groups")
+                        or fragment.get("semantic_groups")
+                        or []
+                    ),
                 }
             )
 
@@ -421,13 +775,14 @@ def build_query_rows(
                 "fragments": per_fragment,
             }
         )
-    return rows
+    return rows, sorted(anchor_fragments.values(), key=lambda row: row["fragment_id"])
 
 
 def build_fragment_rows(
     *,
     task_ids: list[str],
     fragments: dict[str, dict[str, Any]],
+    extra_fragments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     task_id_set = set(task_ids)
     rows: list[dict[str, Any]] = []
@@ -454,9 +809,21 @@ def build_fragment_rows(
                 "source_tasks": surviving_tasks,
                 "skill_names": sorted({source_file["skill_name"] for source_file in surviving_files}),
                 "source_files": surviving_files,
+                "usage_roles": list(fragment.get("usage_roles") or []),
+                "role_counts": dict(fragment.get("role_counts") or {}),
+                "dominant_role": str(fragment.get("dominant_role") or "primary"),
+                "semantic_groups": list(fragment.get("semantic_groups") or []),
+                "group_frequency": int(
+                    fragment.get("group_frequency", len(surviving_tasks)) or len(surviving_tasks)
+                ),
+                "primary_task_ids": list(fragment.get("primary_task_ids") or []),
+                "core_support_task_ids": list(fragment.get("core_support_task_ids") or []),
+                "secondary_task_ids": list(fragment.get("secondary_task_ids") or []),
                 "text": fragment["text"],
             }
         )
+    for fragment in sorted(extra_fragments or [], key=lambda row: row["fragment_id"]):
+        rows.append(fragment)
     return rows
 
 
@@ -499,18 +866,24 @@ def write_variant(
     tasks: dict[str, dict[str, Any]],
     task_files: dict[str, list[SourceFile]],
     fragments: dict[str, dict[str, Any]],
+    task_fragment_meta: dict[str, dict[str, dict[str, Any]]],
     summary: dict[str, Any],
     source_root: Path,
 ) -> None:
-    query_rows = build_query_rows(
+    query_rows, anchor_fragments = build_query_rows(
         variant_name=variant_name,
         task_ids=task_ids,
         tasks=tasks,
         task_files=task_files,
         fragments=fragments,
+        task_fragment_meta=task_fragment_meta,
     )
     query_index = {row["task_id"]: row for row in query_rows}
-    fragment_rows = build_fragment_rows(task_ids=task_ids, fragments=fragments)
+    fragment_rows = build_fragment_rows(
+        task_ids=task_ids,
+        fragments=fragments,
+        extra_fragments=anchor_fragments,
+    )
     task_rows = [
         {
             **tasks[task_id],
@@ -558,6 +931,8 @@ def generate_readme(
         "Generated variants:",
         "- `skillsbench_dense_full`: largest connected component under curated exact-fragment overlap",
         "- `skillsbench_dense_core`: `dense_full` minus edge task `pedestrian-traffic-counting`",
+        "- Each query now starts with a short synthetic request brief to separate",
+        "  query-specific intent from reusable skill/support fragments",
         "",
         "Curated fragment policy:",
         "- Keep `SKILL.md`",
@@ -625,6 +1000,12 @@ def main() -> None:
     components = connected_components(adjacency, all_task_ids)
     if not components:
         raise RuntimeError("No connected components found in curated SkillsBench overlap graph.")
+    task_fragment_meta = annotate_fragment_semantics(
+        tasks=tasks,
+        task_files=task_files,
+        fragments=fragments,
+        components=components,
+    )
 
     dense_full_tasks = components[0]
     dense_core_tasks = [task_id for task_id in dense_full_tasks if task_id not in CORE_EXCLUDED_TASKS]
@@ -665,6 +1046,7 @@ def main() -> None:
             tasks=tasks,
             task_files=task_files,
             fragments=fragments,
+            task_fragment_meta=task_fragment_meta,
             summary=dense_full_summary,
             source_root=args.source_root,
         )
@@ -681,6 +1063,7 @@ def main() -> None:
             tasks=tasks,
             task_files=task_files,
             fragments=fragments,
+            task_fragment_meta=task_fragment_meta,
             summary=dense_core_summary,
             source_root=args.source_root,
         )

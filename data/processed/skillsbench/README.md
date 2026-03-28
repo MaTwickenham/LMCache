@@ -6,6 +6,8 @@ the canonical SkillsBench `tasks/` tree for LMCache fragment-reuse benchmarks.
 Generated variants:
 - `skillsbench_dense_full`: largest connected component under curated exact-fragment overlap
 - `skillsbench_dense_core`: `dense_full` minus edge task `pedestrian-traffic-counting`
+- Each query now starts with a short synthetic request brief to separate
+  query-specific intent from reusable skill/support fragments
 
 Curated fragment policy:
 - Keep `SKILL.md`
