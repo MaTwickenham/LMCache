@@ -14,6 +14,7 @@ The script supports processed workload formats under
 - `amem`
 - `memos`
 - `skillsbench`
+- `swe_skillsbench`
 - `dspy_locomo`
 - `memgas`
 
@@ -61,13 +62,13 @@ from compare_prefix_vs_blend_memoryos_server import (
     summarize_online_phase_breakdown,
     summarize_prefill,
 )
+from canonical_semantics import (
+    apply_canonical_semantics,
+    is_skills_workload,
+)
 from utility_guided_prefill import (
     BYTES_PER_TOKEN,
     UtilityPlannerConfig,
-    attach_prior_use_count,
-    enrich_id_backed_hints,
-    enrich_memoryos_hints,
-    enrich_skillsbench_hints,
     plan_prefill_placements,
 )
 
@@ -77,6 +78,7 @@ WORKLOAD_KIND_CHOICES = (
     "amem",
     "memos",
     "skillsbench",
+    "swe_skillsbench",
     "dspy_locomo",
     "memgas",
 )
@@ -95,6 +97,7 @@ DEFAULT_DATASETS_BY_WORKLOAD = {
     "amem": ["conv26", "conv30", "conv41"],
     "memos": ["locomo_conv0", "locomo_conv1", "locomo_conv2"],
     "skillsbench": ["dense_core"],
+    "swe_skillsbench": ["swe_obs_dense"],
     "dspy_locomo": ["conv-26", "conv-30", "conv-41"],
     "memgas": ["locomo10_minilm"],
 }
@@ -170,7 +173,7 @@ def parse_args() -> argparse.Namespace:
         choices=list(FRAGMENT_ORDER_POLICY_CHOICES),
         help=(
             "'auto' resolves to 'profile_last' for memoryos and 'trace' for "
-            "amem/memos/memgas."
+            "amem/memos/memgas/swe_skillsbench."
         ),
     )
     parser.add_argument(
@@ -258,6 +261,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Penalty for choosing GPU admission in the migrated utility planner.",
+    )
+    parser.add_argument(
+        "--utility-enable-semantic-hints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable canonical semantic hints inside the utility-guided prefill planner.",
     )
     parser.add_argument("--blend-check-layers", type=str, default="1")
     parser.add_argument("--blend-recompute-ratios", type=str, default="0.15")
@@ -352,6 +361,7 @@ def main() -> None:
         utility_cost_model=str(args.utility_cost_model),
         utility_tail_lambda=float(args.utility_tail_lambda),
         utility_gpu_penalty_ms=float(args.utility_gpu_penalty_ms),
+        utility_enable_semantic_hints=bool(args.utility_enable_semantic_hints),
         max_local_gpu_size=float(args.max_local_gpu_size),
         max_local_cpu_size=float(args.max_local_cpu_size),
     )
@@ -443,6 +453,12 @@ def resolve_fragment_order_policy(workload_kind: str, raw_policy: str) -> str:
     return "trace"
 
 
+def _skills_data_subdir(workload_kind: str) -> str:
+    if workload_kind == "swe_skillsbench":
+        return "swe_skillsbench"
+    return "skillsbench"
+
+
 def gib_to_bytes(size_gib: float) -> int:
     return int(float(size_gib) * 1024**3)
 
@@ -471,6 +487,7 @@ def build_workload(
     utility_cost_model: str,
     utility_tail_lambda: float,
     utility_gpu_penalty_ms: float,
+    utility_enable_semantic_hints: bool,
     max_local_gpu_size: float,
     max_local_cpu_size: float,
 ) -> dict[str, Any]:
@@ -514,6 +531,7 @@ def build_workload(
             "amem",
             "memos",
             "skillsbench",
+            "swe_skillsbench",
             "dspy_locomo",
             "memgas",
         ):
@@ -530,7 +548,7 @@ def build_workload(
                     tokenizer=tokenizer,
                     unique_chunks=unique_chunks,
                 )
-            elif workload_kind == "skillsbench":
+            elif is_skills_workload(workload_kind):
                 assert memory_index is not None
                 chunk_ids = extract_skillsbench_chunks(
                     dataset=dataset,
@@ -559,7 +577,7 @@ def build_workload(
                 shuffle_seed=shuffle_seed,
             )
             question_text = str(qa_trace.get("question", ""))
-            if workload_kind == "skillsbench":
+            if is_skills_workload(workload_kind):
                 ordered_chunk_ids, fragment_token_ids, _was_trimmed = trim_fragment_sequence_to_fit(
                     tokenizer=tokenizer,
                     system_prompt_ids=system_prompt_ids,
@@ -625,21 +643,13 @@ def build_workload(
                 )
             )
 
-    attach_prior_use_count(
+    apply_canonical_semantics(
+        workload_kind=workload_kind,
         unique_chunks=unique_chunks,
         query_chunk_ids=query_chunk_ids,
+        data_root=data_root,
+        datasets=datasets,
     )
-    if workload_kind == "memoryos":
-        enrich_memoryos_hints(unique_chunks)
-    elif workload_kind == "skillsbench":
-        enrich_skillsbench_hints(unique_chunks)
-    else:
-        enrich_id_backed_hints(
-            workload_kind=workload_kind,
-            unique_chunks=unique_chunks,
-            data_root=data_root,
-            datasets=datasets,
-        )
 
     prefill_order = apply_prefill_order_policy(
         prefill_first_seen=prefill_first_seen,
@@ -654,6 +664,7 @@ def build_workload(
         utility_cost_model=utility_cost_model,
         utility_tail_lambda=utility_tail_lambda,
         utility_gpu_penalty_ms=utility_gpu_penalty_ms,
+        utility_enable_semantic_hints=utility_enable_semantic_hints,
         max_local_gpu_size=max_local_gpu_size,
         max_local_cpu_size=max_local_cpu_size,
     )
@@ -699,6 +710,7 @@ def build_prefill_plan(
     utility_cost_model: str,
     utility_tail_lambda: float,
     utility_gpu_penalty_ms: float,
+    utility_enable_semantic_hints: bool,
     max_local_gpu_size: float,
     max_local_cpu_size: float,
 ) -> dict[str, dict[str, Any]]:
@@ -712,6 +724,7 @@ def build_prefill_plan(
         cfg = UtilityPlannerConfig.from_args(
             utility_cost_model=utility_cost_model,
             tail_lambda=utility_tail_lambda,
+            enable_semantic_hints=bool(utility_enable_semantic_hints),
             gpu_then_cpu_penalty_ms=utility_gpu_penalty_ms,
         )
         placements = plan_prefill_placements(
@@ -793,8 +806,12 @@ def load_trace(
         trace_path = data_root / "amem" / f"amem_{dataset}_qa_trace.json"
     elif workload_kind == "memos":
         trace_path = data_root / "memos" / f"memos_{dataset}_qa_trace.json"
-    elif workload_kind == "skillsbench":
-        trace_path = data_root / "skillsbench" / f"skillsbench_{dataset}_queries.jsonl"
+    elif is_skills_workload(workload_kind):
+        trace_path = (
+            data_root
+            / _skills_data_subdir(workload_kind)
+            / f"skillsbench_{dataset}_queries.jsonl"
+        )
     elif workload_kind == "dspy_locomo":
         loaded = []
         for row in load_dspy_locomo_rows(data_root=data_root, dataset=dataset):
@@ -922,8 +939,12 @@ def load_memory_index(
         memory_path = data_root / "amem" / f"amem_{dataset}_memorys.json"
     elif workload_kind == "memos":
         memory_path = data_root / "memos" / f"memos_{dataset}_memorys.json"
-    elif workload_kind == "skillsbench":
-        memory_path = data_root / "skillsbench" / f"skillsbench_{dataset}_fragments.jsonl"
+    elif is_skills_workload(workload_kind):
+        memory_path = (
+            data_root
+            / _skills_data_subdir(workload_kind)
+            / f"skillsbench_{dataset}_fragments.jsonl"
+        )
     elif workload_kind == "dspy_locomo":
         loaded = []
         for row in load_dspy_locomo_rows(data_root=data_root, dataset=dataset):
@@ -1168,7 +1189,7 @@ def extract_skillsbench_chunks(
         fragment_record = memory_index.get(fragment_key)
         if fragment_record is None:
             raise KeyError(
-                f"Missing fragment_id={fragment_key!r} in skillsbench dataset={dataset}"
+                f"Missing fragment_id={fragment_key!r} in skills workload dataset={dataset}"
             )
 
         text = str(fragment_record.get("text", "")).strip()
@@ -1252,7 +1273,7 @@ def resolve_sample_id(
         return str(qa_trace.get("query_id", f"{dataset}:{qa_index}"))
     if workload_kind == "memgas":
         return str(qa_trace.get("query_id", f"{dataset}:{qa_index}"))
-    if workload_kind == "skillsbench":
+    if is_skills_workload(workload_kind):
         return str(
             qa_trace.get("query_id")
             or qa_trace.get("task_id")

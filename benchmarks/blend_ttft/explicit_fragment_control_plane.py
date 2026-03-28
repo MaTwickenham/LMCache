@@ -14,6 +14,7 @@ from utility_guided_prefill import (
     FragmentTierUtility,
     UtilityPlannerConfig as MaintenanceUtilityPlannerConfig,
     estimate_fragment_tier_utilities,
+    estimate_gpu_upgrade_value,
 )
 
 
@@ -33,6 +34,15 @@ def _is_missing_fragment_error(exc: BaseException, src_backend: str) -> bool:
         "Cannot move fragment: failed to fetch memory objects",
     )
     return any(pattern in message for pattern in missing_patterns)
+
+
+def _canonical_workload_kind_from_hints(hints: dict[str, Any]) -> str:
+    return str(
+        hints.get("canonical_workload_kind")
+        or hints.get("workload_kind")
+        or hints.get("canonical_workload_family")
+        or ""
+    ).strip().lower()
 
 
 def _worker_probe_lmcache_engine(_worker_wrapper: Any) -> dict[str, Any]:
@@ -522,10 +532,8 @@ class ExplicitFragmentPool:
         tokens = max(int(self.fragment_tokens.get(chunk_id, 0) or 0), 1)
         return float(value) / math.sqrt(float(tokens))
 
-    def _gpu_admission_value(self, utility: FragmentTierUtility) -> float:
-        if self.cpu_enabled:
-            return float(utility.gpu_premium_admit)
-        return float(utility.admit_gpu)
+    def _gpu_admission_value(self, chunk_id: str) -> float:
+        return self._gpu_priority_for_chunk(chunk_id, current_tier="miss")
 
     def _admission_candidates_with_scores(
         self,
@@ -544,16 +552,15 @@ class ExplicitFragmentPool:
             scored_candidates.append(
                 ("cpu", cpu_value, self._value_density(chunk_id, cpu_value))
             )
-        else:
-            gpu_value = self._gpu_admission_value(utility)
-            if self.gpu_enabled and gpu_value > 0.0:
-                scored_candidates.append(
-                    (
-                        "gpu",
-                        float(gpu_value),
-                        self._soft_size_priority(chunk_id, gpu_value),
-                    )
+        gpu_value = self._gpu_admission_value(chunk_id)
+        if self.gpu_enabled and gpu_value > 0.0:
+            scored_candidates.append(
+                (
+                    "gpu",
+                    float(gpu_value),
+                    self._soft_size_priority(chunk_id, gpu_value),
                 )
+            )
         scored_candidates.sort(key=lambda item: (item[2], item[1]), reverse=True)
         return scored_candidates
 
@@ -614,11 +621,79 @@ class ExplicitFragmentPool:
     ) -> float:
         utility = self._chunk_utility(chunk_id)
         location = current_tier or self._location_of(chunk_id)
-        if location == "miss":
-            return float(utility.gpu_premium_admit)
-        if location == "cpu":
-            return float(utility.gpu_premium_keep)
-        return float(utility.keep_gpu)
+        meta = self._fragment_meta(chunk_id)
+        hints = dict(meta.get("hints") or {})
+        return float(
+            estimate_gpu_upgrade_value(
+                utility=utility,
+                hints=hints,
+                current_query_idx=int(self.query_index),
+                current_tier=location,
+                cpu_enabled=self.cpu_enabled,
+                enable_semantic_hints=bool(
+                    self.maintenance_cfg is not None
+                    and self.maintenance_cfg.enable_semantic_hints
+                ),
+            )
+        )
+
+    def _shared_skill_protection_bonus(
+        self,
+        chunk_id: str,
+    ) -> float:
+        if not self._utility_policy_enabled():
+            return 0.0
+
+        meta = self._fragment_meta(chunk_id)
+        fragment_kind = str(meta.get("type") or "").strip().lower()
+        hints = dict(meta.get("hints") or {})
+        workload_kind = _canonical_workload_kind_from_hints(hints)
+        role = str(hints.get("attachment_role") or "").strip().lower()
+        group_frequency = max(int(hints.get("group_frequency", 0) or 0), 0)
+
+        if (
+            workload_kind == "skillsbench"
+        ):
+            if (
+                role == "core_support"
+                and fragment_kind in {"skill_md", "reference", "asset", "script"}
+                and group_frequency >= 8
+            ):
+                return 4.0
+            if (
+                role == "secondary_support"
+                and fragment_kind in {"skill_md", "reference"}
+                and group_frequency >= 3
+            ):
+                return 3.0
+
+        return 0.0
+
+    def _force_fit_shared_skill_fragment(
+        self,
+        chunk_id: str,
+        *,
+        target_tier: TierName,
+    ) -> bool:
+        if target_tier not in {"cpu", "gpu"}:
+            return False
+
+        meta = self._fragment_meta(chunk_id)
+        fragment_kind = str(meta.get("type") or "").strip().lower()
+        hints = dict(meta.get("hints") or {})
+        workload_kind = _canonical_workload_kind_from_hints(hints)
+        role = str(hints.get("attachment_role") or "").strip().lower()
+        group_frequency = max(int(hints.get("group_frequency", 0) or 0), 0)
+
+        if (
+            workload_kind == "swe_skillsbench"
+            and role == "core_support"
+            and fragment_kind in {"skill_md", "reference", "asset"}
+            and group_frequency >= 4
+        ):
+            return True
+
+        return self._shared_skill_protection_bonus(chunk_id) > 0.0
 
     def _select_cpu_victim(self) -> tuple[str, float] | None:
         if not self.cpu_lru:
@@ -631,6 +706,7 @@ class ExplicitFragmentPool:
         victim_value = float("inf")
         for chunk_id in self.cpu_lru:
             keep_value = float(self._chunk_utility(chunk_id).keep_cpu)
+            keep_value += float(self._shared_skill_protection_bonus(chunk_id))
             if victim_id is None or keep_value < victim_value:
                 victim_id = chunk_id
                 victim_value = keep_value
@@ -648,7 +724,11 @@ class ExplicitFragmentPool:
         victim_id: str | None = None
         victim_value = float("inf")
         for chunk_id in self.gpu_lru:
-            keep_value = float(self._chunk_utility(chunk_id).gpu_premium_keep)
+            keep_value = self._gpu_priority_for_chunk(
+                chunk_id,
+                current_tier="gpu",
+            )
+            keep_value += float(self._shared_skill_protection_bonus(chunk_id))
             if victim_id is None or keep_value < victim_value:
                 victim_id = chunk_id
                 victim_value = keep_value
@@ -695,6 +775,58 @@ class ExplicitFragmentPool:
             probe_shadow_misses=probe_shadow_miss,
         ).get(chunk_id, "miss")
 
+    def _probe_actual_location(self, chunk_id: str) -> TierName:
+        actual = self.runtime.probe_fragment_locations(
+            {chunk_id: list(self.prefill_records[chunk_id].prompt_ids)}
+        ).get(chunk_id, "miss")
+        actual_tier: TierName = "miss"
+        if actual == "gpu":
+            actual_tier = "gpu"
+        elif actual == "cpu":
+            actual_tier = "cpu"
+        self._set_shadow_location(chunk_id, actual_tier)
+        return actual_tier
+
+    def _verified_materialize_stats(
+        self,
+        *,
+        chunk_id: str,
+        target_tier: TierName,
+        wall_s: float,
+    ) -> MaintenanceStats:
+        stats = MaintenanceStats(
+            wall_s=wall_s,
+            materialize_s=wall_s,
+        )
+        if self._probe_actual_location(chunk_id) == target_tier:
+            stats.admitted_chunks = 1
+            stats.admitted_tokens = int(self.fragment_tokens[chunk_id])
+        return stats
+
+    def _verified_move_stats(
+        self,
+        *,
+        chunk_id: str,
+        src_tier: TierName,
+        target_tier: TierName,
+        wall_s: float,
+    ) -> MaintenanceStats:
+        stats = MaintenanceStats(
+            wall_s=wall_s,
+            move_s=wall_s,
+        )
+        if self._probe_actual_location(chunk_id) != target_tier:
+            return stats
+
+        tokens = int(self.fragment_tokens[chunk_id])
+        if src_tier == "cpu" and target_tier == "gpu":
+            stats.promoted_chunks = 1
+            stats.promoted_tokens = tokens
+        else:
+            stats.demoted_chunks = 1
+            stats.demoted_tokens = tokens
+        return stats
+
     def _evict_cpu_chunk(self, victim: str) -> MaintenanceStats:
         if self._reconcile_chunk_location(victim) != "cpu":
             return MaintenanceStats()
@@ -722,6 +854,7 @@ class ExplicitFragmentPool:
         needed_tokens: int,
         *,
         incoming_value: float | None = None,
+        force_fit: bool = False,
     ) -> MaintenanceStats:
         stats = MaintenanceStats()
         cumulative_loss = 0.0
@@ -735,7 +868,11 @@ class ExplicitFragmentPool:
                 break
             victim_id, victim_value = victim
             loss = max(float(victim_value), 0.0)
-            if incoming_value is not None and cumulative_loss + loss >= incoming_value:
+            if (
+                not force_fit
+                and incoming_value is not None
+                and cumulative_loss + loss >= incoming_value
+            ):
                 break
             cumulative_loss += loss
             stats.absorb(self._evict_cpu_chunk(victim_id))
@@ -784,13 +921,11 @@ class ExplicitFragmentPool:
                         self.prefill_records[victim],
                         location=LOCAL_CPU_BACKEND,
                     )
-                    self._insert_into_tier_state(victim, "cpu")
                     stats.absorb(
-                        MaintenanceStats(
+                        self._verified_materialize_stats(
+                            chunk_id=victim,
+                            target_tier="cpu",
                             wall_s=wall_s,
-                            materialize_s=wall_s,
-                            admitted_chunks=1,
-                            admitted_tokens=tokens,
                         )
                     )
             return stats
@@ -840,24 +975,20 @@ class ExplicitFragmentPool:
                                 self.prefill_records[victim],
                                 location=LOCAL_CPU_BACKEND,
                             )
-                            self._insert_into_tier_state(victim, "cpu")
                             stats.absorb(
-                                MaintenanceStats(
+                                self._verified_materialize_stats(
+                                    chunk_id=victim,
+                                    target_tier="cpu",
                                     wall_s=wall_s,
-                                    materialize_s=wall_s,
-                                    admitted_chunks=1,
-                                    admitted_tokens=tokens,
                                 )
                             )
                     return stats
-                self._remove_from_tier_state(victim, "gpu")
-                self._insert_into_tier_state(victim, "cpu")
                 stats.absorb(
-                    MaintenanceStats(
+                    self._verified_move_stats(
+                        chunk_id=victim,
+                        src_tier="gpu",
+                        target_tier="cpu",
                         wall_s=wall_s,
-                        move_s=wall_s,
-                        demoted_chunks=1,
-                        demoted_tokens=tokens,
                     )
                 )
                 return stats
@@ -888,6 +1019,7 @@ class ExplicitFragmentPool:
         needed_tokens: int,
         *,
         incoming_value: float | None = None,
+        force_fit: bool = False,
     ) -> MaintenanceStats:
         stats = MaintenanceStats()
         cumulative_loss = 0.0
@@ -901,7 +1033,11 @@ class ExplicitFragmentPool:
                 break
             victim_id, victim_value = victim
             loss = max(float(victim_value), 0.0)
-            if incoming_value is not None and cumulative_loss + loss >= incoming_value:
+            if (
+                not force_fit
+                and incoming_value is not None
+                and cumulative_loss + loss >= incoming_value
+            ):
                 break
             cumulative_loss += loss
             stats.absorb(self._demote_gpu_chunk(victim_id))
@@ -978,13 +1114,11 @@ class ExplicitFragmentPool:
                     self.prefill_records[chunk_id],
                     location=location,
                 )
-                self._insert_into_tier_state(chunk_id, tier)
                 stats.absorb(
-                    MaintenanceStats(
+                    self._verified_materialize_stats(
+                        chunk_id=chunk_id,
+                        target_tier=tier,
                         wall_s=wall_s,
-                        materialize_s=wall_s,
-                        admitted_chunks=1,
-                        admitted_tokens=tokens,
                     )
                 )
                 break
@@ -1052,6 +1186,10 @@ class ExplicitFragmentPool:
             return MaintenanceStats()
 
         stats = MaintenanceStats()
+        force_fit = self._force_fit_shared_skill_fragment(
+            chunk_id,
+            target_tier=target_tier,
+        )
         if target_tier == "gpu":
             incoming_gpu_value = (
                 self._gpu_priority_for_chunk(chunk_id, current_tier=current)
@@ -1062,6 +1200,7 @@ class ExplicitFragmentPool:
                 self._make_room_gpu(
                     tokens,
                     incoming_value=incoming_gpu_value,
+                    force_fit=force_fit,
                 )
             )
             if self.gpu_used_tokens + tokens > self.gpu_budget_tokens:
@@ -1076,6 +1215,7 @@ class ExplicitFragmentPool:
                 self._make_room_cpu(
                     tokens,
                     incoming_value=incoming_cpu_value,
+                    force_fit=force_fit,
                 )
             )
             if self.cpu_used_tokens + tokens > self.cpu_budget_tokens:
@@ -1087,13 +1227,11 @@ class ExplicitFragmentPool:
                 self.prefill_records[chunk_id],
                 location=target_backend,
             )
-            self._insert_into_tier_state(chunk_id, target_tier)
             stats.absorb(
-                MaintenanceStats(
+                self._verified_materialize_stats(
+                    chunk_id=chunk_id,
+                    target_tier=target_tier,
                     wall_s=wall_s,
-                    materialize_s=wall_s,
-                    admitted_chunks=1,
-                    admitted_tokens=tokens,
                 )
             )
             return stats
@@ -1114,37 +1252,23 @@ class ExplicitFragmentPool:
                 self.prefill_records[chunk_id],
                 location=target_backend,
             )
-            self._insert_into_tier_state(chunk_id, target_tier)
             stats.absorb(
-                MaintenanceStats(
+                self._verified_materialize_stats(
+                    chunk_id=chunk_id,
+                    target_tier=target_tier,
                     wall_s=wall_s,
-                    materialize_s=wall_s,
-                    admitted_chunks=1,
-                    admitted_tokens=tokens,
                 )
             )
             return stats
 
-        self._remove_from_tier_state(chunk_id, current)
-        self._insert_into_tier_state(chunk_id, target_tier)
-        if current == "cpu" and target_tier == "gpu":
-            stats.absorb(
-                MaintenanceStats(
-                    wall_s=wall_s,
-                    move_s=wall_s,
-                    promoted_chunks=1,
-                    promoted_tokens=tokens,
-                )
+        stats.absorb(
+            self._verified_move_stats(
+                chunk_id=chunk_id,
+                src_tier=current,
+                target_tier=target_tier,
+                wall_s=wall_s,
             )
-        else:
-            stats.absorb(
-                MaintenanceStats(
-                    wall_s=wall_s,
-                    move_s=wall_s,
-                    demoted_chunks=1,
-                    demoted_tokens=tokens,
-                )
-            )
+        )
         return stats
 
     def run_inter_query_maintenance(

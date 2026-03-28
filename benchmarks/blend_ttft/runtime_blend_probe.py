@@ -6,18 +6,18 @@ from typing import Any
 
 from transformers import AutoTokenizer
 
+from canonical_semantics import (
+    apply_canonical_semantics,
+    is_skills_workload,
+)
 from compare_prefix_vs_blend_gpu_workload_server import (
     append_token_segment,
     apply_prefill_order_policy,
-    attach_prior_use_count,
     build_prefill_plan,
     build_prefill_records,
     build_prompt_token_ids,
     build_system_prompt_ids,
     build_workload_stats,
-    enrich_id_backed_hints,
-    enrich_memoryos_hints,
-    enrich_skillsbench_hints,
     extract_id_backed_chunks,
     extract_memoryos_chunks,
     extract_skillsbench_chunks,
@@ -81,6 +81,7 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
             "amem",
             "memos",
             "skillsbench",
+            "swe_skillsbench",
             "dspy_locomo",
             "memgas",
         ):
@@ -97,7 +98,7 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
                     tokenizer=tokenizer,
                     unique_chunks=unique_chunks,
                 )
-            elif args.workload_kind == "skillsbench":
+            elif is_skills_workload(args.workload_kind):
                 assert memory_index is not None
                 chunk_ids = extract_skillsbench_chunks(
                     dataset=dataset,
@@ -126,7 +127,7 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
                 shuffle_seed=args.shuffle_seed,
             )
             question_text = str(qa_trace.get("question", ""))
-            if args.workload_kind == "skillsbench":
+            if is_skills_workload(args.workload_kind):
                 ordered_chunk_ids, fragment_token_ids, _was_trimmed = trim_fragment_sequence_to_fit(
                     tokenizer=tokenizer,
                     system_prompt_ids=system_prompt_ids,
@@ -182,22 +183,13 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
                 )
             )
 
-    attach_prior_use_count(
+    apply_canonical_semantics(
+        workload_kind=args.workload_kind,
         unique_chunks=unique_chunks,
         query_chunk_ids=query_chunk_ids,
+        data_root=data_root,
+        datasets=datasets,
     )
-
-    if args.workload_kind == "memoryos":
-        enrich_memoryos_hints(unique_chunks)
-    elif args.workload_kind == "skillsbench":
-        enrich_skillsbench_hints(unique_chunks)
-    else:
-        enrich_id_backed_hints(
-            workload_kind=args.workload_kind,
-            unique_chunks=unique_chunks,
-            data_root=data_root,
-            datasets=datasets,
-        )
 
     prefill_order = apply_prefill_order_policy(
         prefill_first_seen=prefill_first_seen,
@@ -212,6 +204,9 @@ def build_workload_for_probe(args: Any) -> dict[str, Any]:
         utility_cost_model=args.utility_cost_model,
         utility_tail_lambda=args.utility_tail_lambda,
         utility_gpu_penalty_ms=args.utility_gpu_penalty_ms,
+        utility_enable_semantic_hints=bool(
+            getattr(args, "utility_enable_semantic_hints", True)
+        ),
         max_local_gpu_size=args.max_local_gpu_size,
         max_local_cpu_size=args.max_local_cpu_size,
     )

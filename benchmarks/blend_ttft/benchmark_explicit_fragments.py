@@ -14,6 +14,7 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 
+from canonical_semantics import strip_past_only_runtime_hints
 from compare_prefix_vs_blend_gpu_workload_server import gib_to_token_budget
 from compare_prefix_vs_blend_memoryos_server import (
     LatencySummary,
@@ -38,6 +39,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     EXECUTION_MODE_NATIVE_VLLM,
 )
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from online_semantic_stats import OnlineSemanticStats
 from runtime_blend_probe import (
     build_phase_index,
     build_workload_for_probe,
@@ -119,6 +121,7 @@ class ExplicitBlendSummary:
     online_execution_mode: str
     blend_engine_prefix_caching: bool
     utility_enable_semantic_hints: bool
+    online_use_historical_stats: bool
     utility_mode_recompute_requests: int
     utility_mode_blend_requests: int
     mean_predicted_recompute_utility_ms: float
@@ -142,6 +145,7 @@ class BenchmarkResult:
     datasets: list[str]
     chunk_size: int
     workload: WorkloadStats
+    canonical_semantics_summary: dict[str, Any]
     no_prefix: LatencySummary | None
     native_prefix: LatencySummary | None
     explicit_blend: ExplicitBlendSummary | None
@@ -157,7 +161,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--workload-kind",
-        choices=["memos", "memoryos", "amem", "skillsbench", "dspy_locomo", "memgas"],
+        choices=[
+            "memos",
+            "memoryos",
+            "amem",
+            "skillsbench",
+            "swe_skillsbench",
+            "dspy_locomo",
+            "memgas",
+        ],
         required=True,
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
@@ -258,12 +270,18 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
+        "--online-use-historical-stats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--utility-enable-cpu-recompute",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument("--utility-fallback-margin-ms", type=float, default=0.0)
     parser.add_argument("--utility-prefix-history-window", type=int, default=0)
+    parser.add_argument("--online-gap-alpha", type=float, default=0.5)
     parser.add_argument(
         "--utility-native-runtime",
         choices=["recompute"],
@@ -372,6 +390,7 @@ def decide_online_execution_mode(
     unique_chunks: dict[str, dict[str, Any]],
     snapshot: Any,
     utility_cfg: OnlineUtilityPlannerConfig | None,
+    current_query_idx: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     if str(args.online_execution_policy) != "utility" or utility_cfg is None:
         return str(args.online_execution_mode), {
@@ -396,6 +415,7 @@ def decide_online_execution_mode(
         prefix_reuse_tokens=0,
         fallback_margin_ms=float(args.utility_fallback_margin_ms or 0.0),
         cfg=utility_cfg,
+        current_query_idx=current_query_idx,
     )
     mode = (
         EXECUTION_MODE_NATIVE_VLLM
@@ -412,10 +432,29 @@ def decide_online_execution_mode(
         "cacheblend_utility_ms": float(
             debug.get("cacheblend_utility_ms", 0.0) or 0.0
         ),
+        "cacheblend_effective_utility_ms": float(
+            debug.get("cacheblend_effective_utility_ms", 0.0) or 0.0
+        ),
+        "predicted_native_ttft_ms": float(
+            debug.get("predicted_native_ttft_ms", 0.0) or 0.0
+        ),
+        "predicted_blend_ttft_ms": float(
+            debug.get("predicted_blend_ttft_ms", 0.0) or 0.0
+        ),
         "decision_gap_ms": float(debug.get("decision_gap_ms", 0.0) or 0.0),
         "effective_fallback_margin_ms": float(
             debug.get("effective_fallback_margin_ms", 0.0) or 0.0
         ),
+        "skills_bootstrap_bonus_ms": float(
+            debug.get("skills_bootstrap_bonus_ms", 0.0) or 0.0
+        ),
+        "skills_miss_blend_bonus_ms": float(
+            debug.get("skills_miss_blend_bonus_ms", 0.0) or 0.0
+        ),
+        "fragmented_miss_fastpath_bonus_ms": float(
+            debug.get("fragmented_miss_fastpath_bonus_ms", 0.0) or 0.0
+        ),
+        "predicted_regret_ms": float(debug.get("predicted_regret_ms", 0.0) or 0.0),
         "cacheblend_fetch_actions": list(debug.get("cacheblend_fetch_actions", [])),
         "prefix_reuse_disabled": True,
     }
@@ -637,7 +676,27 @@ def seed_pool_from_prefill_plan(
     prefill_plan: dict[str, dict[str, Any]],
 ) -> MaintenanceStats:
     stats = MaintenanceStats()
-    for chunk_id in prefill_order:
+    order_index = {chunk_id: idx for idx, chunk_id in enumerate(prefill_order)}
+
+    def _seed_priority(chunk_id: str) -> tuple[int, int, float, int]:
+        plan_item = dict(prefill_plan.get(chunk_id) or {})
+        if not bool(plan_item.get("enabled", False)):
+            return (0, 0, 0.0, -order_index.get(chunk_id, 0))
+        target_location = str(plan_item.get("target_location") or "")
+        gpu_rank = 1 if target_location == "LocalGPUBackend" else 0
+        try:
+            utility = float(plan_item.get("utility") or 0.0)
+        except Exception:
+            utility = 0.0
+        return (1, gpu_rank, utility, -order_index.get(chunk_id, 0))
+
+    ordered_chunk_ids = sorted(
+        list(prefill_order),
+        key=_seed_priority,
+        reverse=True,
+    )
+
+    for chunk_id in ordered_chunk_ids:
         plan_item = dict(prefill_plan.get(chunk_id) or {})
         if not bool(plan_item.get("enabled", False)):
             continue
@@ -707,8 +766,26 @@ def build_query_rows(
                 "predicted_cacheblend_utility_ms": execution.get(
                     "predicted_cacheblend_utility_ms", 0.0
                 ),
+                "predicted_native_ttft_ms": execution.get(
+                    "predicted_native_ttft_ms", 0.0
+                ),
+                "predicted_blend_ttft_ms": execution.get(
+                    "predicted_blend_ttft_ms", 0.0
+                ),
                 "predicted_decision_gap_ms": execution.get(
                     "predicted_decision_gap_ms", 0.0
+                ),
+                "effective_fallback_margin_ms": execution.get(
+                    "effective_fallback_margin_ms", 0.0
+                ),
+                "hybrid_gate_penalty_ms": execution.get(
+                    "hybrid_gate_penalty_ms", 0.0
+                ),
+                "skills_miss_blend_bonus_ms": execution.get(
+                    "skills_miss_blend_bonus_ms", 0.0
+                ),
+                "fragmented_miss_fastpath_bonus_ms": execution.get(
+                    "fragmented_miss_fastpath_bonus_ms", 0.0
                 ),
                 "ttft_s": measurement.ttft_s,
                 "wall_s": measurement.wall_s,
@@ -849,8 +926,18 @@ def run_explicit_blend(
             shadow_rows: list[dict[str, Any]] = []
             execution_rows: list[dict[str, Any]] = []
             maintenance_rows: list[MaintenanceStats] = []
+            online_stats = (
+                OnlineSemanticStats(gap_alpha=float(args.online_gap_alpha or 0.5))
+                if bool(args.online_use_historical_stats)
+                else None
+            )
 
             for index, record in enumerate(query_records):
+                if online_stats is not None:
+                    online_stats.inject_chunk_hints(
+                        unique_chunks=workload["unique_chunks"],
+                        current_query_idx=index,
+                    )
                 pool.reconcile_shadow_locations(list(record.chunk_ids))
                 snapshot = pool.capture_query_reuse(record.chunk_ids)
                 execution_mode, execution_debug = decide_online_execution_mode(
@@ -859,6 +946,7 @@ def run_explicit_blend(
                     unique_chunks=workload["unique_chunks"],
                     snapshot=snapshot,
                     utility_cfg=online_utility_cfg,
+                    current_query_idx=index,
                 )
                 query_sampling_params = runtime.make_sampling_params(
                     request_kind="online_blended_query",
@@ -883,11 +971,51 @@ def run_explicit_blend(
                         "predicted_cacheblend_utility_ms": float(
                             execution_debug.get("cacheblend_utility_ms", 0.0) or 0.0
                         ),
+                        "predicted_native_ttft_ms": float(
+                            execution_debug.get("predicted_native_ttft_ms", 0.0)
+                            or 0.0
+                        ),
+                        "predicted_blend_ttft_ms": float(
+                            execution_debug.get("predicted_blend_ttft_ms", 0.0)
+                            or 0.0
+                        ),
                         "predicted_decision_gap_ms": float(
                             execution_debug.get("decision_gap_ms", 0.0) or 0.0
                         ),
+                        "effective_fallback_margin_ms": float(
+                            execution_debug.get("effective_fallback_margin_ms", 0.0)
+                            or 0.0
+                        ),
+                        "hybrid_gate_penalty_ms": float(
+                            execution_debug.get("hybrid_gate_penalty_ms", 0.0)
+                            or 0.0
+                        ),
+                        "skills_miss_blend_bonus_ms": float(
+                            execution_debug.get("skills_miss_blend_bonus_ms", 0.0)
+                            or 0.0
+                        ),
+                        "fragmented_miss_fastpath_bonus_ms": float(
+                            execution_debug.get(
+                                "fragmented_miss_fastpath_bonus_ms", 0.0
+                            )
+                            or 0.0
+                        ),
                     }
                 )
+
+                if online_stats is not None:
+                    online_stats.observe_query(
+                        unique_chunks=workload["unique_chunks"],
+                        chunk_ids=list(record.chunk_ids),
+                        query_idx=index,
+                        locations=snapshot.locations,
+                    )
+                    # Maintenance should consume the current query's access evidence,
+                    # otherwise just-used fragments are judged with stale history.
+                    online_stats.inject_chunk_hints(
+                        unique_chunks=workload["unique_chunks"],
+                        current_query_idx=index,
+                    )
 
                 next_chunk_ids = None
                 if index + 1 < len(query_records) and int(args.gpu_lookahead) > 0:
@@ -960,6 +1088,7 @@ def run_explicit_blend(
         online_execution_mode=str(args.online_execution_mode),
         blend_engine_prefix_caching=bool(engine_prefix_caching),
         utility_enable_semantic_hints=bool(args.utility_enable_semantic_hints),
+        online_use_historical_stats=bool(args.online_use_historical_stats),
         utility_mode_recompute_requests=int(recompute_requests),
         utility_mode_blend_requests=int(blend_requests),
         mean_predicted_recompute_utility_ms=mean_or_zero(
@@ -1014,6 +1143,137 @@ def print_maintenance_summary(name: str, summary: MaintenanceSummary) -> None:
     )
 
 
+def _round_float_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 4)
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / float(len(values))
+
+
+def _sorted_count_dict(counts: dict[str, int]) -> dict[str, int]:
+    return {key: int(counts[key]) for key in sorted(counts)}
+
+
+def _canonical_prefill_bucket(meta: dict[str, Any]) -> str:
+    target_location = str(meta.get("target_location") or "")
+    if target_location == "LocalGPUBackend":
+        return "gpu"
+    if target_location == "LocalCPUBackend":
+        return "cpu"
+    return "drop"
+
+
+def _summarize_canonical_bucket(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    kind_counts: dict[str, int] = {}
+    layer_counts: dict[str, int] = {}
+    semantic_group_counts: dict[str, int] = {}
+    importance_scores: list[float] = []
+    stability_scores: list[float] = []
+    sharedness_scores: list[float] = []
+    relation_degrees: list[float] = []
+    retention_priors: list[float] = []
+    affinity_scores: list[float] = []
+    future_use_reference_counts: list[float] = []
+    next_use_window_queries: list[float] = []
+
+    for chunk in chunks:
+        semantics = chunk.get("canonical_semantics") or {}
+        kind = str(semantics.get("kind") or chunk.get("type") or "unknown")
+        layer = str(semantics.get("layer") or chunk.get("layer") or "unknown")
+        kind_counts[kind] = int(kind_counts.get(kind, 0) + 1)
+        layer_counts[layer] = int(layer_counts.get(layer, 0) + 1)
+
+        for group in semantics.get("semantic_groups") or []:
+            group_name = str(group).strip()
+            if group_name:
+                semantic_group_counts[group_name] = int(
+                    semantic_group_counts.get(group_name, 0) + 1
+                )
+
+        importance_scores.append(float(semantics.get("importance_score", 0.0)))
+        stability_scores.append(float(semantics.get("stability_score", 0.0)))
+        sharedness_scores.append(float(semantics.get("sharedness_score", 0.0)))
+        relation_degrees.append(float(semantics.get("relation_degree", 0.0)))
+        retention_priors.append(float(semantics.get("retention_prior", 0.0)))
+        affinity_scores.append(float(semantics.get("affinity_score", 0.0)))
+        future_use_reference_counts.append(
+            float(semantics.get("future_use_reference_count", 0.0))
+        )
+        next_use_window_queries.append(
+            float(semantics.get("next_use_window_queries", 0.0))
+        )
+
+    summary = {
+        "fragment_count": len(chunks),
+        "kind_counts": _sorted_count_dict(kind_counts),
+        "layer_counts": _sorted_count_dict(layer_counts),
+        "mean_importance_score": _round_float_or_none(_mean_or_none(importance_scores)),
+        "mean_stability_score": _round_float_or_none(_mean_or_none(stability_scores)),
+        "mean_sharedness_score": _round_float_or_none(_mean_or_none(sharedness_scores)),
+        "mean_relation_degree": _round_float_or_none(_mean_or_none(relation_degrees)),
+        "mean_retention_prior": _round_float_or_none(_mean_or_none(retention_priors)),
+        "mean_affinity_score": _round_float_or_none(_mean_or_none(affinity_scores)),
+        "mean_future_use_reference_count": _round_float_or_none(
+            _mean_or_none(future_use_reference_counts)
+        ),
+        "mean_next_use_window_queries": _round_float_or_none(
+            _mean_or_none(next_use_window_queries)
+        ),
+    }
+    if semantic_group_counts:
+        summary["semantic_group_counts"] = _sorted_count_dict(semantic_group_counts)
+    return summary
+
+
+def summarize_canonical_semantics(
+    *,
+    unique_chunks: dict[str, dict[str, Any]],
+    prefill_plan: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    version_counts: dict[str, int] = {}
+    family_counts: dict[str, int] = {}
+    bucket_chunks: dict[str, list[dict[str, Any]]] = {
+        "all": [],
+        "gpu": [],
+        "cpu": [],
+        "drop": [],
+    }
+    missing_count = 0
+
+    for chunk_id, chunk in unique_chunks.items():
+        semantics = chunk.get("canonical_semantics")
+        if not isinstance(semantics, dict) or not semantics:
+            missing_count += 1
+            continue
+
+        version_key = str(semantics.get("version") or "unknown")
+        family_key = str(semantics.get("workload_family") or "unknown")
+        version_counts[version_key] = int(version_counts.get(version_key, 0) + 1)
+        family_counts[family_key] = int(family_counts.get(family_key, 0) + 1)
+
+        bucket_chunks["all"].append(chunk)
+        bucket = _canonical_prefill_bucket(prefill_plan.get(chunk_id) or {})
+        bucket_chunks[bucket].append(chunk)
+
+    return {
+        "fragments_with_canonical_semantics": len(bucket_chunks["all"]),
+        "fragments_without_canonical_semantics": int(missing_count),
+        "canonical_version_counts": _sorted_count_dict(version_counts),
+        "canonical_workload_family_counts": _sorted_count_dict(family_counts),
+        "all_fragments": _summarize_canonical_bucket(bucket_chunks["all"]),
+        "prefill_targets": {
+            "gpu": _summarize_canonical_bucket(bucket_chunks["gpu"]),
+            "cpu": _summarize_canonical_bucket(bucket_chunks["cpu"]),
+            "drop": _summarize_canonical_bucket(bucket_chunks["drop"]),
+        },
+    }
+
+
 def print_dry_run_summary(
     *,
     out_dir: Path,
@@ -1049,6 +1309,10 @@ def print_dry_run_summary(
             unique_chunks=unique_chunks,
             prefill_plan=prefill_plan,
         ),
+        "canonical_semantics_summary": summarize_canonical_semantics(
+            unique_chunks=unique_chunks,
+            prefill_plan=prefill_plan,
+        ),
         "out_dir": str(out_dir),
     }
 
@@ -1081,6 +1345,14 @@ def print_dry_run_summary(
         f"records={summary['prefill_record_count']} "
         f"placement_counts={summary['prefill_plan_counts']}"
     )
+    canonical_summary = summary["canonical_semantics_summary"]
+    all_fragments = canonical_summary["all_fragments"]
+    print(
+        "canonical: "
+        f"fragments={canonical_summary['fragments_with_canonical_semantics']} "
+        f"retention={all_fragments['mean_retention_prior']:.4f} "
+        f"affinity={all_fragments['mean_affinity_score']:.4f}"
+    )
     print(f"dry_run_json: {output_path}")
 
 
@@ -1093,6 +1365,10 @@ def main() -> None:
 
     with blend_cpu_bench_module().temporary_environ(runtime_env):
         workload = build_workload_for_probe(args)
+        if bool(args.online_use_historical_stats):
+            strip_past_only_runtime_hints(
+                unique_chunks=workload["unique_chunks"],
+            )
         if bool(args.dry_run):
             print_dry_run_summary(
                 out_dir=out_dir,
@@ -1142,6 +1418,10 @@ def main() -> None:
         datasets=list(workload["datasets"]),
         chunk_size=int(args.chunk_size),
         workload=workload["stats"],
+        canonical_semantics_summary=summarize_canonical_semantics(
+            unique_chunks=workload["unique_chunks"],
+            prefill_plan=workload["prefill_plan"],
+        ),
         no_prefix=no_prefix,
         native_prefix=native_prefix,
         explicit_blend=explicit_blend,
@@ -1170,6 +1450,7 @@ def main() -> None:
         print(
             "explicit_blend_utility: "
             f"semantic_hints={explicit_blend.utility_enable_semantic_hints} "
+            f"historical_stats={explicit_blend.online_use_historical_stats} "
             f"recompute_requests={explicit_blend.utility_mode_recompute_requests} "
             f"blend_requests={explicit_blend.utility_mode_blend_requests} "
             f"mean_pred_recompute_ms={explicit_blend.mean_predicted_recompute_utility_ms:.3f} "

@@ -132,20 +132,23 @@ def _future_reuse_features(
     *,
     current_query_idx: int | None,
 ) -> tuple[int, int | None]:
-    positions = _normalize_query_positions(hints.get("query_positions"))
-    if positions:
-        if current_query_idx is None:
-            return len(positions), int(positions[0])
+    del current_query_idx
+    estimated_count = hints.get("estimated_future_use_count")
+    if estimated_count is None:
+        estimated_count = hints.get("online_estimated_future_use_count")
 
-        pivot = bisect.bisect_right(positions, int(current_query_idx))
-        if pivot >= len(positions):
-            return 0, None
+    estimated_distance = hints.get("estimated_next_use_distance_queries")
+    if estimated_distance is None:
+        estimated_distance = hints.get("online_estimated_next_use_distance_queries")
 
-        next_position = int(positions[pivot])
-        return len(positions) - pivot, max(next_position - int(current_query_idx), 0)
-
-    remaining = max(int(hints.get("remaining_use_count", hints.get("prior_use_count", 0)) or 0), 0)
-    return remaining, None
+    remaining = max(int(estimated_count or hints.get("prior_use_count", 0) or 0), 0)
+    if estimated_distance is None:
+        return remaining, None
+    try:
+        distance = max(int(estimated_distance), 0)
+    except Exception:
+        distance = None
+    return remaining, distance
 
 
 def _centered_future_distance(distance: int | None, *, reference_window: float) -> float:
@@ -165,6 +168,244 @@ def _hint_next_use_window(hints: dict[str, Any], *, default: float) -> float:
     return max(_float_or(hints.get("next_use_window_queries"), default), 1.0)
 
 
+def _canonical_workload_family_from_hints(hints: dict[str, Any]) -> str:
+    family = str(
+        hints.get("canonical_workload_family")
+        or hints.get("canonical_workload_kind")
+        or hints.get("workload_family")
+        or ""
+    ).strip()
+    return family.lower()
+
+
+def _canonical_workload_kind_from_hints(hints: dict[str, Any]) -> str:
+    kind = str(
+        hints.get("canonical_workload_kind")
+        or hints.get("workload_kind")
+        or hints.get("canonical_workload_family")
+        or ""
+    ).strip()
+    return kind.lower()
+
+
+def _prefill_startup_scales(
+    hints: dict[str, Any],
+    *,
+    current_query_idx: int | None,
+    enabled: bool = True,
+) -> tuple[float, float]:
+    if not enabled:
+        return 1.0, 1.0
+    if current_query_idx is None or int(current_query_idx) > 0:
+        return 1.0, 1.0
+
+    remaining_use_count, next_use_distance = _future_reuse_features(
+        hints,
+        current_query_idx=current_query_idx,
+    )
+    if remaining_use_count <= 0:
+        return 0.0, 0.0
+
+    family = _canonical_workload_family_from_hints(hints)
+    horizon = 48.0 if family == "memgas" else 96.0
+    distance = float(max(int(next_use_distance or 0), 0))
+    proximity = 1.0 / (1.0 + (distance / horizon))
+    count_bonus = _clamp(_log1p_safe(remaining_use_count) / math.log1p(16.0), 0.0, 1.0)
+
+    gpu_scale = _clamp(
+        0.15 + (0.70 * proximity) + (0.15 * count_bonus),
+        0.10,
+        1.0,
+    )
+    return 1.0, float(gpu_scale)
+
+
+def _semantic_groups_from_hints(hints: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(item).strip().lower()
+        for item in (hints.get("semantic_groups") or [])
+        if str(item).strip()
+    )
+
+
+def _semantic_pattern_reuse_adjustment(
+    *,
+    hints: dict[str, Any],
+    kind: str,
+    tokens: int,
+    remaining_use_count: int,
+    next_use_distance: int | None,
+) -> float:
+    role = str(hints.get("attachment_role", "") or "").strip().lower()
+    seen_count = max(int(hints.get("online_seen_count", 0) or 0), 0)
+    group_seen_count = max(int(hints.get("online_group_seen_count", 0) or 0), 0)
+    retention = _clamp(_float_or(hints.get("retention_prior"), 0.0), 0.0, 1.0)
+    stability = _clamp(_float_or(hints.get("stability_score"), 0.0), 0.0, 1.0)
+    sharedness = _clamp(_float_or(hints.get("sharedness_score"), 0.0), 0.0, 1.0)
+    importance = _clamp(_float_or(hints.get("importance_score"), 0.0), 0.0, 1.0)
+    groups = _semantic_groups_from_hints(hints)
+    summary_backed = ("summary_backed" in groups) or bool(
+        str(hints.get("summary") or "").strip()
+    )
+    support_artifact = role in {"core_support", "secondary_support"}
+    context_summary = summary_backed or kind in {
+        "session_anchor",
+        "assistant_knowledge",
+        "knowledge",
+        "user_profile",
+    }
+    cold_primary_large = (
+        role == "primary"
+        and max(int(tokens or 0), 0) >= 1536
+        and seen_count <= 0
+        and group_seen_count <= 1
+        and remaining_use_count <= 0
+        and sharedness < 0.55
+        and retention < 0.68
+    )
+
+    adjustment = 0.0
+
+    if support_artifact and sharedness >= 0.60:
+        adjustment += 0.18
+        if group_seen_count >= 2 or seen_count >= 1 or remaining_use_count > 0:
+            adjustment += 0.34
+        if stability >= 0.45:
+            adjustment += 0.10
+        if importance >= 0.70:
+            adjustment += 0.08
+        if next_use_distance is None or int(next_use_distance) <= 8:
+            adjustment += 0.10
+
+    if context_summary and retention >= 0.68 and stability >= 0.60:
+        if group_seen_count >= 2 or seen_count >= 1 or remaining_use_count > 0:
+            adjustment += 0.24
+            if sharedness >= 0.48:
+                adjustment += 0.14
+            if next_use_distance is None or int(next_use_distance) <= 8:
+                adjustment += 0.10
+
+    if cold_primary_large:
+        adjustment -= 0.42
+        if next_use_distance is None or int(next_use_distance or 99) > 4:
+            adjustment -= 0.18
+
+    return float(adjustment)
+
+
+def _skills_reuse_adjustment(
+    *,
+    hints: dict[str, Any],
+    kind: str,
+    tokens: int,
+    remaining_use_count: int,
+    next_use_distance: int | None,
+) -> float:
+    if _canonical_workload_family_from_hints(hints) != "skillsbench":
+        return 0.0
+
+    workload_kind = _canonical_workload_kind_from_hints(hints)
+    kind = str(kind or "").strip().lower()
+    role = str(hints.get("attachment_role", "") or "").strip().lower()
+    seen_count = max(int(hints.get("online_seen_count", 0) or 0), 0)
+    group_seen_count = max(int(hints.get("online_group_seen_count", 0) or 0), 0)
+    sharedness = _clamp(_float_or(hints.get("sharedness_score"), 0.0), 0.0, 1.0)
+    retention = _clamp(_float_or(hints.get("retention_prior"), 0.0), 0.0, 1.0)
+    stability = _clamp(_float_or(hints.get("stability_score"), 0.0), 0.0, 1.0)
+    has_reuse_evidence = (
+        remaining_use_count > 0
+        or seen_count > 0
+        or group_seen_count >= 2
+        or next_use_distance is not None
+    )
+
+    adjustment = 0.0
+    if role == "core_support":
+        adjustment += 0.26
+    elif role == "secondary_support":
+        adjustment += 0.10
+    elif role == "primary":
+        adjustment -= 0.12
+
+    if kind in {"skill_md", "reference"} and role != "primary":
+        adjustment += 0.14
+    elif kind == "script" and role == "primary":
+        adjustment -= 0.08
+
+    cold_large_primary = (
+        role == "primary"
+        and max(int(tokens or 0), 0) >= 1536
+        and remaining_use_count <= 0
+        and seen_count <= 0
+        and group_seen_count <= 1
+        and sharedness < 0.45
+        and retention < 0.58
+    )
+    if cold_large_primary:
+        adjustment -= 0.42
+
+    if not has_reuse_evidence:
+        if role in {"core_support", "secondary_support"} and sharedness >= 0.62:
+            adjustment += 0.08
+        return float(adjustment)
+
+    exhausted = remaining_use_count <= 0 and seen_count <= 0 and group_seen_count <= 1
+    if exhausted:
+        adjustment -= 0.55 if role == "core_support" else 0.30
+        distance = None
+    else:
+        distance = max(int(next_use_distance or 0), 0)
+        evidence = max(remaining_use_count, seen_count, max(group_seen_count - 1, 0))
+        adjustment += 0.10 * min(float(evidence), 4.0)
+        if next_use_distance is None and group_seen_count >= 2:
+            adjustment += 0.22
+        elif distance <= 1:
+            adjustment += 0.65 if role == "core_support" else 0.32
+        elif distance <= 4:
+            adjustment += 0.30 if role == "core_support" else 0.12
+        elif distance >= 12:
+            adjustment -= 0.25
+        elif distance >= 8:
+            adjustment -= 0.12
+
+    if workload_kind == "skillsbench":
+        if (
+            role == "secondary_support"
+            and kind in {"skill_md", "reference"}
+            and not exhausted
+        ):
+            adjustment += 0.22
+        elif (
+            role == "core_support"
+            and kind in {"skill_md", "reference", "script", "asset"}
+            and not exhausted
+        ):
+            adjustment += 0.18
+
+    if workload_kind == "swe_skillsbench":
+        if kind == "skill_md":
+            if role == "core_support" and not exhausted:
+                adjustment += 0.18
+                if distance is not None and distance <= 2:
+                    adjustment += 0.12
+            elif role == "primary" and exhausted:
+                adjustment -= 0.15
+        elif kind in {"reference", "asset", "script"}:
+            if exhausted:
+                adjustment -= 0.45
+            elif distance is None or distance > 2:
+                adjustment -= 0.18
+            if sharedness < 0.45 and seen_count <= 0 and group_seen_count <= 1:
+                adjustment -= 0.12
+        elif kind == "task_brief":
+            adjustment -= 0.50
+
+    if stability >= 0.70 and sharedness >= 0.58 and role != "primary":
+        adjustment += 0.12
+
+    return float(adjustment)
+
+
 @dataclass(frozen=True)
 class UtilityPlannerConfig:
     cost_model: CostModel
@@ -174,6 +415,8 @@ class UtilityPlannerConfig:
     w_hotness: float = 0.45
     w_importance: float = 0.8
     w_kind: float = 0.9
+    w_retention: float = 0.55
+    w_affinity: float = 0.45
     w_graph: float = 0.2
     w_future_use: float = 0.9
     w_next_use: float = 0.7
@@ -254,7 +497,21 @@ def reuse_score_from_hints(
             hints.get("importance_score")
         )
         score += cfg.w_kind * _kind_score(kind)
-        score += cfg.w_graph * _log1p_safe(hints.get("graph_in_degree"))
+        score += cfg.w_retention * _centered_importance(
+            hints.get("retention_prior")
+        )
+        score += cfg.w_affinity * _centered_importance(
+            hints.get("affinity_score")
+        )
+        relation_degree = hints.get("relation_degree")
+        if relation_degree is None:
+            graph_in_degree = max(int(hints.get("graph_in_degree", 0) or 0), 0)
+            relation_degree = _clamp(
+                graph_in_degree / 4.0,
+                0.0,
+                1.0,
+            )
+        score += cfg.w_graph * _centered_importance(relation_degree)
         score += cfg.w_future_use * _centered_hotness(
             remaining_use_count,
             reference_count=future_use_reference_count,
@@ -262,6 +519,20 @@ def reuse_score_from_hints(
         score += cfg.w_next_use * _centered_future_distance(
             next_use_distance,
             reference_window=next_use_window,
+        )
+        score += _semantic_pattern_reuse_adjustment(
+            hints=hints,
+            kind=kind,
+            tokens=tokens,
+            remaining_use_count=remaining_use_count,
+            next_use_distance=next_use_distance,
+        )
+        score += _skills_reuse_adjustment(
+            hints=hints,
+            kind=kind,
+            tokens=tokens,
+            remaining_use_count=remaining_use_count,
+            next_use_distance=next_use_distance,
         )
     if cfg.w_tokens:
         score -= cfg.w_tokens * _log1p_safe(tokens)
@@ -331,6 +602,56 @@ class FragmentTierUtility:
     writeback_ms: float
     cpu_saved_ms: float
     gpu_saved_ms: float
+
+
+def _imminent_reuse_windows(family: str) -> tuple[int, int]:
+    normalized = (family or "").strip().lower()
+    if normalized == "memgas":
+        return 2, 8
+    return 1, 4
+
+
+def estimate_gpu_upgrade_value(
+    *,
+    utility: FragmentTierUtility,
+    hints: dict[str, Any],
+    current_query_idx: int | None,
+    current_tier: str,
+    cpu_enabled: bool,
+    enable_semantic_hints: bool,
+) -> float:
+    tier = (current_tier or "miss").strip().lower()
+    if tier == "miss":
+        base_value = float(utility.gpu_premium_admit if cpu_enabled else utility.admit_gpu)
+        full_gpu_value = float(utility.admit_gpu)
+    else:
+        base_value = float(utility.gpu_premium_keep if cpu_enabled else utility.keep_gpu)
+        full_gpu_value = float(utility.keep_gpu)
+
+    if not cpu_enabled:
+        return float(base_value)
+    if not math.isfinite(base_value):
+        return float(base_value)
+    if not enable_semantic_hints:
+        return float(base_value)
+
+    remaining_use_count, next_use_distance = _future_reuse_features(
+        hints,
+        current_query_idx=current_query_idx,
+    )
+    if remaining_use_count <= 0 or next_use_distance is None:
+        return float(base_value)
+
+    urgent_window, near_window = _imminent_reuse_windows(
+        _canonical_workload_family_from_hints(hints)
+    )
+    distance = max(int(next_use_distance), 0)
+    if distance <= urgent_window:
+        return float(max(base_value, full_gpu_value))
+    if distance <= near_window:
+        protected_value = float((0.5 * full_gpu_value) + (0.5 * base_value))
+        return float(max(base_value, protected_value))
+    return float(base_value)
 
 
 def estimate_fragment_tier_utilities(
@@ -425,6 +746,7 @@ def choose_admit_action(
     access_count: int = 0,
     queries_since_access: int | None = None,
     current_query_idx: int | None = None,
+    startup_prefill: bool = False,
 ) -> tuple[str, float, dict[str, float]]:
     token_count = max(int(tokens or 0), 0)
     if token_count <= 0:
@@ -448,6 +770,17 @@ def choose_admit_action(
     if gpu_free_tokens >= token_count:
         util_gpu = utility.admit_gpu
 
+    cpu_startup_scale = 1.0
+    gpu_startup_scale = 1.0
+    if startup_prefill:
+        cpu_startup_scale, gpu_startup_scale = _prefill_startup_scales(
+            hints,
+            current_query_idx=current_query_idx,
+            enabled=bool(cfg.enable_semantic_hints),
+        )
+        if math.isfinite(util_gpu):
+            util_gpu *= gpu_startup_scale
+
     util_drop = 0.0
     best = max(util_drop, util_cpu, util_gpu)
     if best <= 0.0:
@@ -460,6 +793,8 @@ def choose_admit_action(
                 "util_cpu": float(util_cpu),
                 "util_gpu": float(util_gpu),
                 "gpu_premium_admit": float(utility.gpu_premium_admit),
+                "startup_cpu_scale": float(cpu_startup_scale),
+                "startup_gpu_scale": float(gpu_startup_scale),
             },
         )
 
@@ -473,20 +808,198 @@ def choose_admit_action(
                 "util_cpu": float(util_cpu),
                 "util_gpu": float(util_gpu),
                 "gpu_premium_admit": float(utility.gpu_premium_admit),
+                "startup_cpu_scale": float(cpu_startup_scale),
+                "startup_gpu_scale": float(gpu_startup_scale),
             },
         )
 
     return (
         "cpu",
         float(util_cpu),
-        {
-            "score": float(utility.score),
-            "p_reuse": float(utility.p_reuse),
-            "util_cpu": float(util_cpu),
-            "util_gpu": float(util_gpu),
-            "gpu_premium_admit": float(utility.gpu_premium_admit),
-        },
+            {
+                "score": float(utility.score),
+                "p_reuse": float(utility.p_reuse),
+                "util_cpu": float(util_cpu),
+                "util_gpu": float(util_gpu),
+                "gpu_premium_admit": float(utility.gpu_premium_admit),
+                "startup_cpu_scale": float(cpu_startup_scale),
+                "startup_gpu_scale": float(gpu_startup_scale),
+            },
+        )
+
+
+def _prefill_priority_key(
+    *,
+    layer: str,
+    kind: str,
+    tokens: int,
+    hints: dict[str, Any],
+    cfg: UtilityPlannerConfig,
+    writeback_async: bool,
+    gpu_enabled: bool,
+    cpu_enabled: bool,
+    startup_prefill: bool = False,
+) -> tuple[float, float, float]:
+    current_query_idx = -1
+    utility = estimate_fragment_tier_utilities(
+        layer=layer,
+        kind=kind,
+        tokens=tokens,
+        hints=hints,
+        cfg=cfg,
+        access_count=0,
+        queries_since_access=None,
+        current_query_idx=current_query_idx,
+        writeback_async=writeback_async,
+        has_cpu_fallback=cpu_enabled,
     )
+    token_count = max(int(tokens or 0), 1)
+    cpu_startup_scale = 1.0
+    gpu_startup_scale = 1.0
+    if startup_prefill:
+        cpu_startup_scale, gpu_startup_scale = _prefill_startup_scales(
+            hints,
+            current_query_idx=current_query_idx,
+            enabled=bool(cfg.enable_semantic_hints),
+        )
+
+    cpu_density = float("-inf")
+    cpu_value = float("-inf")
+    if cpu_enabled and utility.admit_cpu > 0.0:
+        cpu_value = float(utility.admit_cpu) * float(cpu_startup_scale)
+        cpu_density = cpu_value / float(token_count)
+
+    gpu_density = float("-inf")
+    gpu_value = float("-inf")
+    if gpu_enabled and utility.admit_gpu > 0.0:
+        gpu_value = float(utility.admit_gpu) * float(gpu_startup_scale)
+        gpu_density = gpu_value / math.sqrt(float(token_count))
+
+    if gpu_density >= cpu_density:
+        return float(gpu_density), float(gpu_value), 1.0
+    return float(cpu_density), float(cpu_value), 0.0
+
+
+def _prefill_gpu_priority_key(
+    *,
+    layer: str,
+    kind: str,
+    tokens: int,
+    hints: dict[str, Any],
+    cfg: UtilityPlannerConfig,
+    writeback_async: bool,
+    cpu_enabled: bool,
+) -> tuple[float, float]:
+    current_query_idx = -1
+    utility = estimate_fragment_tier_utilities(
+        layer=layer,
+        kind=kind,
+        tokens=tokens,
+        hints=hints,
+        cfg=cfg,
+        access_count=0,
+        queries_since_access=None,
+        current_query_idx=current_query_idx,
+        writeback_async=writeback_async,
+        has_cpu_fallback=cpu_enabled,
+    )
+    _cpu_scale, gpu_scale = _prefill_startup_scales(
+        hints,
+        current_query_idx=current_query_idx,
+        enabled=bool(cfg.enable_semantic_hints),
+    )
+    token_count = max(int(tokens or 0), 1)
+    gpu_value = estimate_gpu_upgrade_value(
+        utility=utility,
+        hints=hints,
+        current_query_idx=current_query_idx,
+        current_tier="miss",
+        cpu_enabled=cpu_enabled,
+        enable_semantic_hints=bool(cfg.enable_semantic_hints),
+    ) * float(gpu_scale)
+    gpu_density = gpu_value / math.sqrt(float(token_count))
+    return float(gpu_density), float(gpu_value)
+
+
+def _rebalance_startup_gpu_placements(
+    *,
+    placements: list[PrefillPlacement],
+    unique_chunks: dict[str, dict[str, Any]],
+    gpu_budget_tokens: int,
+    cpu_budget_tokens: int,
+    cfg: UtilityPlannerConfig,
+    writeback_async: bool,
+) -> list[PrefillPlacement]:
+    enabled_ids = [item.chunk_id for item in placements if item.action != "drop"]
+    if not enabled_ids:
+        return placements
+
+    total_enabled_tokens = sum(
+        max(int(unique_chunks[chunk_id].get("tokens", 0) or 0), 0)
+        for chunk_id in enabled_ids
+    )
+    required_gpu_tokens = max(int(total_enabled_tokens) - int(cpu_budget_tokens), 0)
+    if required_gpu_tokens <= 0:
+        return placements
+
+    ranked_ids = sorted(
+        enabled_ids,
+        key=lambda chunk_id: _prefill_gpu_priority_key(
+            layer=str(unique_chunks[chunk_id].get("layer", "unknown")),
+            kind=str(
+                unique_chunks[chunk_id].get("type")
+                or unique_chunks[chunk_id].get("memory_type")
+                or ""
+            ),
+            tokens=int(unique_chunks[chunk_id].get("tokens", 0) or 0),
+            hints=dict(unique_chunks[chunk_id].get("hints") or {}),
+            cfg=cfg,
+            writeback_async=writeback_async,
+            cpu_enabled=bool(cpu_budget_tokens > 0),
+        ),
+        reverse=True,
+    )
+
+    selected_gpu: set[str] = set()
+    selected_gpu_tokens = 0
+    for chunk_id in ranked_ids:
+        token_count = max(int(unique_chunks[chunk_id].get("tokens", 0) or 0), 0)
+        if token_count <= 0:
+            continue
+        if selected_gpu_tokens + token_count > int(gpu_budget_tokens):
+            continue
+        selected_gpu.add(chunk_id)
+        selected_gpu_tokens += token_count
+        if selected_gpu_tokens >= required_gpu_tokens:
+            break
+
+    if selected_gpu_tokens < required_gpu_tokens:
+        return placements
+
+    rebalanced: list[PrefillPlacement] = []
+    for item in placements:
+        if item.action == "drop":
+            rebalanced.append(item)
+            continue
+        if item.chunk_id in selected_gpu:
+            rebalanced.append(
+                PrefillPlacement(
+                    chunk_id=item.chunk_id,
+                    action="gpu_then_cpu",
+                    utility=float(item.utility),
+                    target_location="LocalGPUBackend",
+                )
+            )
+            continue
+        rebalanced.append(
+            PrefillPlacement(
+                chunk_id=item.chunk_id,
+                action="cpu",
+                utility=float(item.utility),
+                target_location="LocalCPUBackend",
+            )
+        )
+    return rebalanced
 
 
 @dataclass(frozen=True)
@@ -509,8 +1022,30 @@ def plan_prefill_placements(
     placements: list[PrefillPlacement] = []
     gpu_free_tokens = max(int(gpu_budget_tokens or 0), 0)
     cpu_free_tokens = max(int(cpu_budget_tokens or 0), 0)
+    gpu_enabled = gpu_free_tokens > 0
+    cpu_enabled = cpu_free_tokens > 0
 
-    for chunk_id in prefill_order:
+    ordered_chunk_ids = sorted(
+        list(prefill_order),
+        key=lambda chunk_id: _prefill_priority_key(
+            layer=str(unique_chunks[chunk_id].get("layer", "unknown")),
+            kind=str(
+                unique_chunks[chunk_id].get("type")
+                or unique_chunks[chunk_id].get("memory_type")
+                or ""
+            ),
+            tokens=int(unique_chunks[chunk_id].get("tokens", 0) or 0),
+            hints=dict(unique_chunks[chunk_id].get("hints") or {}),
+            cfg=cfg,
+            writeback_async=writeback_async,
+            gpu_enabled=gpu_enabled,
+            cpu_enabled=cpu_enabled,
+            startup_prefill=False,
+        ),
+        reverse=True,
+    )
+
+    for chunk_id in ordered_chunk_ids:
         chunk = unique_chunks[chunk_id]
         token_count = int(chunk.get("tokens", 0) or 0)
         layer = str(chunk.get("layer", "unknown"))
@@ -524,6 +1059,8 @@ def plan_prefill_placements(
             cfg=cfg,
             gpu_free_tokens=gpu_free_tokens,
             writeback_async=writeback_async,
+            current_query_idx=-1,
+            startup_prefill=False,
         )
 
         target_location: str | None = None
@@ -551,6 +1088,16 @@ def plan_prefill_placements(
                 utility=float(utility),
                 target_location=target_location,
             )
+        )
+
+    if gpu_enabled and cpu_enabled and placements:
+        placements = _rebalance_startup_gpu_placements(
+            placements=placements,
+            unique_chunks=unique_chunks,
+            gpu_budget_tokens=gpu_budget_tokens,
+            cpu_budget_tokens=cpu_budget_tokens,
+            cfg=cfg,
+            writeback_async=writeback_async,
         )
 
     return placements
@@ -617,6 +1164,122 @@ def _memgas_importance(meta: dict[str, Any]) -> float:
     return _clamp(importance, 0.0, 1.0)
 
 
+def _memgas_session_id_from_memory_id(memory_id: str) -> str:
+    raw = str(memory_id or "").strip()
+    if ":" not in raw:
+        return raw
+    return raw.split(":", 1)[1].strip()
+
+
+def _merge_float_stats(
+    base: dict[str, dict[str, float]],
+    incoming: dict[str, dict[str, float]],
+) -> None:
+    for key, stats in incoming.items():
+        merged = base.setdefault(key, {})
+        for metric, value in stats.items():
+            merged[metric] = float(merged.get(metric, 0.0)) + float(value)
+
+
+def _build_memgas_trace_stats(
+    trace_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    stats_by_memory: dict[str, dict[str, float]] = {}
+    score_by_granularity = {
+        "session": "session_score",
+        "turn": "turn_score",
+        "summary": "summary_score",
+        "keyword": "keyword_score",
+    }
+    for row in trace_rows:
+        router_weights = row.get("query_router_weights") or {}
+        router_session = _clamp(_float_or(router_weights.get("session"), 0.0), 0.0, 1.0)
+        router_turn = _clamp(_float_or(router_weights.get("turn"), 0.0), 0.0, 1.0)
+        router_summary = _clamp(_float_or(router_weights.get("summary"), 0.0), 0.0, 1.0)
+        router_keyword = _clamp(_float_or(router_weights.get("keyword"), 0.0), 0.0, 1.0)
+        dominant = str(row.get("dominant_granularity", "") or "").strip().lower()
+        dominant_score_key = score_by_granularity.get(dominant, "")
+        graph_applied = bool(row.get("graph_applied"))
+        seed_session_ids = {
+            str(session_id).strip()
+            for session_id in (row.get("seed_session_ids") or [])
+            if str(session_id).strip()
+        }
+        for item in row.get("retrieval_ranked_items") or []:
+            memory_id = str(item.get("memory_id", "") or "").strip()
+            if not memory_id:
+                continue
+            stats = stats_by_memory.setdefault(memory_id, {})
+            stats["ranked_appear_count"] = stats.get("ranked_appear_count", 0.0) + 1.0
+
+            rank_raw = item.get("rank")
+            try:
+                rank = max(int(rank_raw), 0)
+            except Exception:
+                rank = 0
+            if rank > 0:
+                stats["rank_sum"] = stats.get("rank_sum", 0.0) + float(rank)
+                stats["rank_inverse_sum"] = stats.get("rank_inverse_sum", 0.0) + (
+                    1.0 / float(rank)
+                )
+                if rank == 1:
+                    stats["top1_count"] = stats.get("top1_count", 0.0) + 1.0
+                if rank <= 3:
+                    stats["top3_count"] = stats.get("top3_count", 0.0) + 1.0
+                if rank <= 5:
+                    stats["top5_count"] = stats.get("top5_count", 0.0) + 1.0
+
+            final_score = _float_or(item.get("final_score"), 0.0)
+            ppr_score = _float_or(item.get("ppr_score"), 0.0)
+            summary_score = _float_or(item.get("summary_score"), 0.0)
+            keyword_score = _float_or(item.get("keyword_score"), 0.0)
+            session_score = _float_or(item.get("session_score"), 0.0)
+            turn_score = _float_or(item.get("turn_score"), 0.0)
+            router_score = (
+                (router_session * session_score)
+                + (router_turn * turn_score)
+                + (router_summary * summary_score)
+                + (router_keyword * keyword_score)
+            )
+
+            stats["final_score_sum"] = stats.get("final_score_sum", 0.0) + final_score
+            stats["ppr_score_sum"] = stats.get("ppr_score_sum", 0.0) + ppr_score
+            stats["summary_score_sum"] = (
+                stats.get("summary_score_sum", 0.0) + summary_score
+            )
+            stats["keyword_score_sum"] = (
+                stats.get("keyword_score_sum", 0.0) + keyword_score
+            )
+            stats["session_score_sum"] = (
+                stats.get("session_score_sum", 0.0) + session_score
+            )
+            stats["turn_score_sum"] = stats.get("turn_score_sum", 0.0) + turn_score
+            stats["router_score_sum"] = stats.get("router_score_sum", 0.0) + router_score
+            if dominant_score_key:
+                stats["dominant_score_sum"] = (
+                    stats.get("dominant_score_sum", 0.0)
+                    + _float_or(item.get(dominant_score_key), 0.0)
+                )
+                stats[f"dominant_{dominant}_count"] = (
+                    stats.get(f"dominant_{dominant}_count", 0.0) + 1.0
+                )
+
+            if graph_applied and ppr_score > 0.0:
+                stats["graph_support_count"] = (
+                    stats.get("graph_support_count", 0.0) + 1.0
+                )
+
+            session_id = str(
+                item.get("session_id") or _memgas_session_id_from_memory_id(memory_id)
+            ).strip()
+            if session_id and session_id in seed_session_ids:
+                stats["seed_support_count"] = (
+                    stats.get("seed_support_count", 0.0) + 1.0
+                )
+
+    return stats_by_memory
+
+
 def _normalize_dspy_locomo_dataset_name(dataset: str) -> str:
     raw = str(dataset or "").strip()
     if raw.startswith("conv") and "-" not in raw:
@@ -673,6 +1336,7 @@ def enrich_memoryos_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
     for chunk in unique_chunks.values():
         hints = dict(chunk.get("hints") or {})
         chunk_type = str(chunk.get("type") or "").strip().lower()
+        conversation_id = str(chunk.get("conversation_id", "") or "").strip()
         hints.setdefault("importance_score", _memoryos_importance(str(chunk.get("type"))))
         hints.setdefault("graph_in_degree", 0)
         hints.setdefault(
@@ -695,6 +1359,13 @@ def enrich_memoryos_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
                 "page": 0.5,
             }.get(chunk_type, 1.0),
         )
+        semantic_groups: list[str] = []
+        if conversation_id:
+            semantic_groups.append(f"conversation::{conversation_id}")
+        if chunk_type:
+            semantic_groups.append(f"memory_type::{chunk_type}")
+        if semantic_groups:
+            hints["semantic_groups"] = list(dict.fromkeys(semantic_groups))
         chunk["hints"] = hints
 
 
@@ -855,18 +1526,96 @@ def enrich_id_backed_hints(
                 hints["temporal_index"] = temporal_index
             if source_session_id is not None:
                 hints["source_session_id"] = source_session_id
+            semantic_groups: list[str] = []
+            if source_session_id is not None:
+                semantic_groups.append(f"session::{source_session_id}")
+            if hint_role:
+                semantic_groups.append(f"hint_role::{hint_role}")
+            if unit_type:
+                semantic_groups.append(f"unit::{unit_type}")
+            for speaker in speaker_set:
+                normalized = speaker.lower().replace(" ", "_")
+                if normalized:
+                    semantic_groups.append(f"speaker::{normalized}")
+            if semantic_groups:
+                hints["semantic_groups"] = list(dict.fromkeys(semantic_groups))
         else:
             meta = record.get("meta") or {}
-            keywords = [str(item).strip() for item in (meta.get("keywords") or []) if str(item).strip()]
+            keywords = [
+                str(item).strip()
+                for item in (meta.get("keywords") or [])
+                if str(item).strip()
+            ]
             summary = str(meta.get("summary", "") or "").strip()
-            hints["importance_score"] = _memgas_importance(meta)
-            hints["tags"] = list(keywords)
+            speaker_set = [
+                str(item).strip()
+                for item in (meta.get("speaker_set") or [])
+                if str(item).strip()
+            ]
+            conversation_id = str(meta.get("conversation_id", "") or "").strip()
+            session_index = max(int(meta.get("session_index", 0) or 0), 0)
+            turn_count = max(int(meta.get("turn_count", 0) or 0), 0)
+            keyword_signal = _clamp(float(len(keywords)) / 8.0, 0.0, 1.0)
+            speaker_signal = _clamp(float(len(speaker_set)) / 3.0, 0.0, 1.0)
+            turn_signal = _clamp(_log1p_safe(turn_count) / math.log1p(48.0), 0.0, 1.0)
+            summary_signal = 1.0 if summary else 0.0
+            hints["importance_score"] = _clamp(
+                (0.62 * _memgas_importance(meta))
+                + (0.16 * turn_signal)
+                + (0.12 * keyword_signal)
+                + (0.10 * summary_signal),
+                0.0,
+                1.0,
+            )
+            hints["tags"] = list(keywords) if keywords else list(speaker_set)
             hints["keywords"] = list(keywords)
             if summary:
                 hints["summary"] = summary
             hints["graph_in_degree"] = 0
-            hints["next_use_window_queries"] = 5.0 if len(keywords) >= 6 else 4.0
-            hints["future_use_reference_count"] = 1.25 if len(keywords) >= 4 else 1.0
+            hints["next_use_window_queries"] = _clamp(
+                4.5 + (1.5 * turn_signal) + (0.75 * speaker_signal),
+                4.0,
+                7.5,
+            )
+            hints["future_use_reference_count"] = _clamp(
+                1.0 + (0.9 * keyword_signal) + (0.6 * speaker_signal),
+                1.0,
+                2.8,
+            )
+            hints["memgas_turn_count"] = turn_count
+            hints["memgas_has_image_caption"] = bool(meta.get("has_image_caption"))
+            hints["memgas_has_source_session_summary"] = bool(
+                str(meta.get("source_session_summary", "") or "").strip()
+            )
+            hints["memgas_has_generated_summary"] = bool(
+                str(meta.get("generated_summary", "") or "").strip()
+            )
+            hints["memgas_has_observation"] = bool(
+                str(meta.get("observation_text", "") or "").strip()
+            )
+            hints["memgas_has_event_summary"] = bool(
+                str(meta.get("event_summary_text", "") or "").strip()
+            )
+            if speaker_set:
+                hints["speaker_set"] = speaker_set
+            if conversation_id:
+                hints["conversation_id"] = conversation_id
+            if session_index > 0:
+                hints["session_index"] = session_index
+            semantic_groups: list[str] = []
+            if conversation_id:
+                semantic_groups.append(f"conversation::{conversation_id}")
+            if session_index > 0:
+                session_bucket = "early" if session_index <= 3 else "mid" if session_index <= 7 else "late"
+                semantic_groups.append(f"session_bucket::{session_bucket}")
+            for speaker in speaker_set:
+                normalized = speaker.lower().replace(" ", "_")
+                if normalized:
+                    semantic_groups.append(f"speaker::{normalized}")
+            if summary:
+                semantic_groups.append("summary_backed")
+            if semantic_groups:
+                hints["semantic_groups"] = list(dict.fromkeys(semantic_groups))
         chunk["hints"] = hints
 
 
@@ -875,40 +1624,38 @@ def enrich_skillsbench_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
         "skill_md": 0.76,
         "reference": 0.58,
         "asset": 0.52,
-        "script": 0.06,
+        "script": 0.40,
+        "task_brief": 0.08,
     }
     size_penalty_scale = {
         "skill_md": 0.04,
         "reference": 0.08,
         "asset": 0.11,
-        "script": 0.16,
+        "script": 0.13,
+        "task_brief": 0.05,
     }
     role_bias = {
-        "primary": 0.06,
-        "core_support": 0.18,
-        "secondary_support": 0.08,
+        "primary": -0.14,
+        "core_support": 0.26,
+        "secondary_support": 0.10,
     }
     role_window = {
-        "primary": 4.5,
-        "core_support": 7.5,
+        "primary": 3.0,
+        "core_support": 9.0,
         "secondary_support": 5.5,
     }
     role_future_refs = {
-        "primary": 1.25,
-        "core_support": 2.5,
-        "secondary_support": 1.6,
+        "primary": 1.0,
+        "core_support": 3.2,
+        "secondary_support": 1.8,
+    }
+    role_size_penalty_scale = {
+        "primary": 1.35,
+        "core_support": 0.85,
+        "secondary_support": 1.0,
     }
     for chunk in unique_chunks.values():
         hints = dict(chunk.get("hints") or {})
-        task_frequency = max(
-            int(chunk.get("task_frequency", 0) or hints.get("task_frequency", 0) or 1),
-            1,
-        )
-        group_frequency = max(
-            int(chunk.get("group_frequency", 0) or hints.get("group_frequency", 0) or task_frequency),
-            task_frequency,
-        )
-        prior_use_count = max(int(hints.get("prior_use_count", 0) or 0), 0)
         tokens = max(int(chunk.get("tokens", 0) or 0), 0)
         chunk_type = str(chunk.get("type", "") or "fragment")
         attachment_role = str(
@@ -916,29 +1663,57 @@ def enrich_skillsbench_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
             or hints.get("attachment_role", "")
             or ""
         ).strip().lower()
+        semantic_groups = list(
+            chunk.get("semantic_groups") or hints.get("semantic_groups") or []
+        )
+        skill_group_count = sum(
+            1 for group in semantic_groups if str(group).startswith("skill::")
+        )
+        ephemeral_request = any(
+            str(group).strip().lower() == "ephemeral_request"
+            for group in semantic_groups
+        )
         base_importance = kind_bias.get(chunk_type, 0.6)
-        shared_bonus = min(0.22, 0.08 * _log1p_safe(task_frequency))
-        trace_bonus = min(0.14, 0.05 * _log1p_safe(prior_use_count))
-        group_bonus = min(0.12, 0.05 * _log1p_safe(group_frequency))
+        shared_bonus = (
+            0.10
+            if attachment_role == "core_support"
+            else 0.04
+            if attachment_role == "secondary_support"
+            else 0.0
+        )
+        if skill_group_count >= 2:
+            shared_bonus += 0.08
+        elif skill_group_count == 1 and attachment_role != "primary":
+            shared_bonus += 0.04
         role_bonus = float(role_bias.get(attachment_role, 0.0))
         size_scale = max(float(tokens) / 768.0, 1.0)
         size_penalty = min(
             0.28,
             float(size_penalty_scale.get(chunk_type, 0.06))
+            * float(role_size_penalty_scale.get(attachment_role, 1.0))
             * _log1p_safe(size_scale),
         )
         importance = (
             base_importance
             + shared_bonus
-            + trace_bonus
-            + group_bonus
             + role_bonus
             - size_penalty
         )
-        shared_use_floor = task_frequency + (1 if chunk_type == "skill_md" else 0)
-        hints["prior_use_count"] = max(prior_use_count, shared_use_floor)
+        if attachment_role == "primary":
+            importance -= 0.12
+            if ephemeral_request:
+                importance -= 0.06
+            if tokens >= 1536:
+                importance -= 0.08
+        elif attachment_role == "core_support" and chunk_type in {"skill_md", "reference"}:
+            importance += 0.10
+
         hints["importance_score"] = _clamp(importance, 0.0, 1.0)
-        hints["graph_in_degree"] = max(min(task_frequency - 1, 4), 0)
+        hints["graph_in_degree"] = {
+            "primary": 0,
+            "secondary_support": 1,
+            "core_support": 2,
+        }.get(attachment_role, 0)
         base_window = (
             6.0
             if chunk_type == "skill_md"
@@ -946,22 +1721,21 @@ def enrich_skillsbench_hints(unique_chunks: dict[str, dict[str, Any]]) -> None:
             if chunk_type in ("reference", "asset")
             else 2.5
         )
-        base_future_refs = 2.0 if task_frequency >= 3 else 1.25
         hints["next_use_window_queries"] = max(
             base_window,
             float(role_window.get(attachment_role, base_window)),
         )
         hints["future_use_reference_count"] = max(
-            base_future_refs,
-            float(role_future_refs.get(attachment_role, base_future_refs)),
+            1.0 if attachment_role == "primary" else 1.4,
+            float(role_future_refs.get(attachment_role, 1.25)),
         )
-        hints["task_frequency"] = task_frequency
-        hints["group_frequency"] = group_frequency
         if attachment_role:
             hints["attachment_role"] = attachment_role
         hints["skill_names"] = list(chunk.get("skill_names") or [])
         hints["source_tasks"] = list(chunk.get("source_tasks") or [])
-        semantic_groups = list(chunk.get("semantic_groups") or [])
         if semantic_groups:
             hints["semantic_groups"] = semantic_groups
+        hints.pop("prior_use_count", None)
+        hints.pop("task_frequency", None)
+        hints.pop("group_frequency", None)
         chunk["hints"] = hints

@@ -7,15 +7,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from canonical_semantics import strip_past_only_runtime_hints
 from benchmark_explicit_fragments import (
     DEFAULT_DATA_ROOT,
     DEFAULT_MODEL,
+    build_fragment_management_cfg,
     build_utility_cfg,
     decide_online_execution_mode,
     mean_or_zero,
     seed_pool_from_prefill_plan,
 )
 from explicit_fragment_control_plane import ExplicitFragmentPool
+from online_semantic_stats import OnlineSemanticStats
 from runtime_blend_probe import build_workload_for_probe
 
 
@@ -29,6 +32,9 @@ class OfflineUtilitySummary:
     gpu_budget_gib: float
     initial_fill_mode: str
     admit_misses_to: str
+    fragment_management_policy: str
+    utility_enable_semantic_hints: bool
+    online_use_historical_stats: bool
     gpu_lookahead: int
     utility_mode_recompute_requests: int
     utility_mode_blend_requests: int
@@ -36,6 +42,8 @@ class OfflineUtilitySummary:
     mean_shadow_gpu_hit_tokens: float
     mean_shadow_cpu_hit_tokens: float
     mean_shadow_miss_tokens: float
+    mean_shadow_hit_rate: float
+    mean_shadow_fragment_hit_rate: float
     mean_predicted_recompute_utility_ms: float
     mean_predicted_cacheblend_utility_ms: float
     mean_predicted_decision_gap_ms: float
@@ -44,7 +52,16 @@ class OfflineUtilitySummary:
 
 
 class FakeRuntime:
+    def __init__(self) -> None:
+        self.locations: dict[str, str] = {}
+
+    def _chunk_id(self, prefill_record: Any) -> str:
+        return str(getattr(prefill_record, "chunk_id", "") or "")
+
     def materialize_fragment(self, prefill_record: Any, *, location: str) -> float:
+        chunk_id = self._chunk_id(prefill_record)
+        if chunk_id:
+            self.locations[chunk_id] = "gpu" if "GPU" in location else "cpu"
         return 0.0
 
     def move_fragment(
@@ -55,10 +72,25 @@ class FakeRuntime:
         dst: str,
         remove_src: bool = True,
     ) -> float:
+        chunk_id = self._chunk_id(prefill_record)
+        if chunk_id:
+            self.locations[chunk_id] = "gpu" if "GPU" in dst else "cpu"
         return 0.0
 
     def evict_fragment(self, prefill_record: Any, *, location: str) -> float:
+        chunk_id = self._chunk_id(prefill_record)
+        if chunk_id:
+            self.locations.pop(chunk_id, None)
         return 0.0
+
+    def probe_fragment_locations(
+        self,
+        fragments_to_probe: dict[str, list[int]],
+    ) -> dict[str, str]:
+        return {
+            chunk_id: str(self.locations.get(chunk_id, "miss"))
+            for chunk_id in fragments_to_probe
+        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--datasets", type=str, default="")
     parser.add_argument("--out-dir", type=str, default="")
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--max-local-gpu-size", type=float, default=2.0)
@@ -123,6 +156,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-lookahead", type=int, default=0)
     parser.add_argument(
+        "--fragment-management-policy",
+        choices=["static", "utility"],
+        default="utility",
+    )
+    parser.add_argument(
         "--utility-cost-model",
         type=str,
         default='{"recompute_ms_per_token":0.105,"transfer_gib_per_s":12.0}',
@@ -135,7 +173,18 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--utility-fallback-margin-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--utility-enable-semantic-hints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--online-use-historical-stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--utility-prefix-history-window", type=int, default=0)
+    parser.add_argument("--online-gap-alpha", type=float, default=0.5)
     parser.add_argument(
         "--utility-native-runtime",
         choices=["recompute"],
@@ -175,6 +224,10 @@ def summarize_workload(
     local_args.workload_kind = workload_kind
 
     workload = build_workload_for_probe(local_args)
+    if bool(args.online_use_historical_stats):
+        strip_past_only_runtime_hints(
+            unique_chunks=workload["unique_chunks"],
+        )
     fragment_tokens = {
         chunk_id: int(meta["tokens"])
         for chunk_id, meta in workload["unique_chunks"].items()
@@ -185,17 +238,26 @@ def summarize_workload(
     }
     cpu_budget_tokens = int((float(args.max_local_cpu_size) * (1024**3)) / 131072)
     gpu_budget_tokens = int((float(args.max_local_gpu_size) * (1024**3)) / 131072)
+    maintenance_cfg = (
+        build_fragment_management_cfg(local_args)
+        if str(args.fragment_management_policy) == "utility"
+        else None
+    )
+    online_stats = OnlineSemanticStats(gap_alpha=float(args.online_gap_alpha))
 
     pool = ExplicitFragmentPool(
         runtime=FakeRuntime(),
         prefill_records=prefill_records,
         fragment_tokens=fragment_tokens,
+        fragments=workload["unique_chunks"],
         cpu_budget_tokens=cpu_budget_tokens,
         gpu_budget_tokens=gpu_budget_tokens,
         cpu_enabled=float(args.max_local_cpu_size) > 0,
         gpu_enabled=float(args.max_local_gpu_size) > 0,
         admit_misses_to=args.admit_misses_to,
         gpu_lookahead=int(args.gpu_lookahead),
+        fragment_management_policy=str(args.fragment_management_policy),
+        maintenance_cfg=maintenance_cfg,
     )
 
     if str(args.prefill_placement_policy) == "utility":
@@ -221,6 +283,11 @@ def summarize_workload(
     shadow_rows: list[dict[str, Any]] = []
 
     for index, record in enumerate(query_records):
+        if bool(args.online_use_historical_stats):
+            online_stats.inject_chunk_hints(
+                unique_chunks=workload["unique_chunks"],
+                current_query_idx=index,
+            )
         snapshot = pool.capture_query_reuse(record.chunk_ids)
         execution_mode, execution_debug = decide_online_execution_mode(
             args=local_args,
@@ -228,6 +295,7 @@ def summarize_workload(
             unique_chunks=workload["unique_chunks"],
             snapshot=snapshot,
             utility_cfg=utility_cfg,
+            current_query_idx=index,
         )
         execution_rows.append(
             {
@@ -252,8 +320,23 @@ def summarize_workload(
                 "shadow_gpu_hit_tokens": snapshot.gpu_hit_tokens,
                 "shadow_cpu_hit_tokens": snapshot.cpu_hit_tokens,
                 "shadow_miss_tokens": snapshot.miss_tokens,
+                "shadow_hit_fragments": snapshot.hit_fragments,
+                "shadow_total_fragments": snapshot.hit_fragments
+                + len(snapshot.missed_fragments),
             }
         )
+
+        if bool(args.online_use_historical_stats):
+            online_stats.observe_query(
+                unique_chunks=workload["unique_chunks"],
+                chunk_ids=list(record.chunk_ids),
+                query_idx=index,
+                locations=snapshot.locations,
+            )
+            online_stats.inject_chunk_hints(
+                unique_chunks=workload["unique_chunks"],
+                current_query_idx=index,
+            )
 
         next_chunk_ids = None
         if index + 1 < len(query_records) and int(args.gpu_lookahead) > 0:
@@ -277,6 +360,9 @@ def summarize_workload(
         gpu_budget_gib=float(args.max_local_gpu_size),
         initial_fill_mode=str(args.initial_fill_mode),
         admit_misses_to=str(args.admit_misses_to),
+        fragment_management_policy=str(args.fragment_management_policy),
+        utility_enable_semantic_hints=bool(args.utility_enable_semantic_hints),
+        online_use_historical_stats=bool(args.online_use_historical_stats),
         gpu_lookahead=int(args.gpu_lookahead),
         utility_mode_recompute_requests=int(recompute_requests),
         utility_mode_blend_requests=int(blend_requests),
@@ -291,6 +377,23 @@ def summarize_workload(
         ),
         mean_shadow_miss_tokens=mean_or_zero(
             [row["shadow_miss_tokens"] for row in shadow_rows]
+        ),
+        mean_shadow_hit_rate=mean_or_zero(
+            [
+                float(row["shadow_hit_tokens"])
+                / max(
+                    float(row["shadow_hit_tokens"]) + float(row["shadow_miss_tokens"]),
+                    1.0,
+                )
+                for row in shadow_rows
+            ]
+        ),
+        mean_shadow_fragment_hit_rate=mean_or_zero(
+            [
+                float(row["shadow_hit_fragments"])
+                / max(float(row["shadow_total_fragments"]), 1.0)
+                for row in shadow_rows
+            ]
         ),
         mean_predicted_recompute_utility_ms=mean_or_zero(
             [row["predicted_recompute_utility_ms"] for row in execution_rows]
